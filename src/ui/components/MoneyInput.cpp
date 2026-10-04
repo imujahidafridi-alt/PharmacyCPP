@@ -1,5 +1,7 @@
 #include "ui/components/MoneyInput.h"
 #include <QDoubleValidator>
+#include <QFocusEvent>
+#include <QTimer>
 
 namespace ui {
 
@@ -11,6 +13,9 @@ MoneyInput::MoneyInput(QWidget* parent) : QLineEdit(parent)
     val->setNotation(QDoubleValidator::StandardNotation);
     setValidator(val);
 
+    connect(this, &QLineEdit::textChanged, this, [this](const QString&) {
+        emit valueChanged(value());
+    });
     connect(this, &QLineEdit::editingFinished, this, &MoneyInput::handleEditingFinished);
 }
 
@@ -28,6 +33,12 @@ core::Money MoneyInput::value() const
 void MoneyInput::setValue(core::Money val)
 {
     setText(val.formatted(false));
+}
+
+void MoneyInput::focusInEvent(QFocusEvent* event)
+{
+    QLineEdit::focusInEvent(event);
+    QTimer::singleShot(0, this, &QLineEdit::selectAll);
 }
 
 void MoneyInput::handleEditingFinished()

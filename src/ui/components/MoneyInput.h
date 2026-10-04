@@ -15,6 +15,9 @@ public:
 signals:
     void valueChanged(core::Money val);
 
+protected:
+    void focusInEvent(QFocusEvent* event) override;
+
 private slots:
     void handleEditingFinished();
 };

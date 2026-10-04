@@ -1625,6 +1625,12 @@ void SaleWindow::handleCheckoutShortcut()
 
     PaymentDialog dlg(grandTotal, m_currentCustomer, this);
     if (dlg.exec() == QDialog::Accepted) {
+        domain::Customer chosenCust = dlg.selectedCustomer();
+        if (chosenCust.id > 0) {
+            m_currentCustomer = chosenCust;
+            updateCustomerDisplay();
+        }
+
         domain::Sale sale;
         sale.customerId = m_currentCustomer.id;
         sale.customerName = m_currentCustomer.name;
