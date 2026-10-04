@@ -95,25 +95,41 @@ SaleWindow::SaleWindow(QWidget* parent) : QWidget(parent)
     tableLayout->setContentsMargins(0, 0, 0, 0);
 
     m_cartTable = new DataTable(tableContainer);
-    m_cartTable->setupHeaders({"#", "ITEM NAME", "UNIT", "QTY (F2)", "MRP", "DISC %", "NET PRICE", "TOTAL", "BATCH", "EXPIRY"});
+    m_cartTable->setupHeaders({"#", "ITEM NAME", "UNIT", "BATCH", "EXPIRY", "QTY (F2)", "MRP", "DISC %", "SALE PRICE", "TOTAL"});
+    m_cartTable->horizontalHeader()->setStretchLastSection(false);
     m_cartTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-    m_cartTable->setColumnWidth(0, 32);
-    m_cartTable->setColumnWidth(2, 60);
-    m_cartTable->setColumnWidth(3, 65); // Qty inline editor
-    m_cartTable->setColumnWidth(4, 75); // MRP
-    m_cartTable->setColumnWidth(5, 70); // Disc % inline editor
-    m_cartTable->setColumnWidth(6, 80); // Net Price inline editor
-    m_cartTable->setColumnWidth(7, 90); // Line Total
-    m_cartTable->setColumnWidth(8, 75); // Batch
-    m_cartTable->setColumnWidth(9, 85); // Expiry
 
-    // Install custom inline editor delegate on Qty (3), Disc % (5), and Net Price (6) columns
+    // Synchronize header text alignments with column data alignments
+    for (int i = 0; i < 10; ++i) {
+        if (auto* h = m_cartTable->horizontalHeaderItem(i)) {
+            if (i == 1) {
+                h->setTextAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+            } else if (i == 6 || i == 8 || i == 9) {
+                h->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            } else {
+                h->setTextAlignment(Qt::AlignCenter);
+            }
+        }
+    }
+
+    // Readable, spacious column widths
+    m_cartTable->setColumnWidth(0, 40);  // #
+    m_cartTable->setColumnWidth(2, 75);  // UNIT
+    m_cartTable->setColumnWidth(3, 95);  // BATCH
+    m_cartTable->setColumnWidth(4, 105); // EXPIRY
+    m_cartTable->setColumnWidth(5, 85);  // QTY (F2) inline editor
+    m_cartTable->setColumnWidth(6, 85);  // MRP
+    m_cartTable->setColumnWidth(7, 80);  // DISC % inline editor
+    m_cartTable->setColumnWidth(8, 100); // SALE PRICE inline editor
+    m_cartTable->setColumnWidth(9, 115); // TOTAL
+
+    // Install custom inline editor delegate on Qty (5), Disc % (7), and Sale Price (8) columns
     auto* cartDelegate = new CartTableDelegate([this]() -> const std::vector<domain::CartItem>& {
         return m_cart;
     }, this);
-    m_cartTable->setItemDelegateForColumn(3, cartDelegate);
     m_cartTable->setItemDelegateForColumn(5, cartDelegate);
-    m_cartTable->setItemDelegateForColumn(6, cartDelegate);
+    m_cartTable->setItemDelegateForColumn(7, cartDelegate);
+    m_cartTable->setItemDelegateForColumn(8, cartDelegate);
     m_cartTable->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed | QAbstractItemView::SelectedClicked);
     m_cartTable->installEventFilter(this);
 
@@ -292,7 +308,7 @@ SaleWindow::SaleWindow(QWidget* parent) : QWidget(parent)
         if (row < 0 || row >= static_cast<int>(m_cart.size())) return;
         if (col == 2) {
             handleUnitToggleShortcut();
-        } else if ((col == 5 || col == 6) && !m_cart[row].isDiscountable) {
+        } else if ((col == 7 || col == 8) && !m_cart[row].isDiscountable) {
             AppToast::showWarning(this, QString("🔒 '%1' is Non-Discountable (FMCG / MRP Locked).").arg(m_cart[row].itemName));
         }
     });
@@ -643,46 +659,23 @@ void SaleWindow::addItemToCart(const domain::Item& item, int qty, domain::SaleUn
 
     // Col 0: #
     m_cartTable->setItem(r, 0, makeItem(QString::number(r + 1), Qt::AlignCenter));
-    // Col 1: Name
-    m_cartTable->setItem(r, 1, makeItem(cartItem.itemName));
-    // Col 2: Unit
+
+    // Col 1: ITEM NAME (Bold, crisp dark slate)
+    auto* nameItem = makeItem(cartItem.itemName, Qt::AlignLeft);
+    QFont nameFont = nameItem->font();
+    nameFont.setBold(true);
+    nameItem->setFont(nameFont);
+    nameItem->setForeground(QBrush(QColor("#0F172A")));
+    m_cartTable->setItem(r, 1, nameItem);
+
+    // Col 2: UNIT
     m_cartTable->setItem(r, 2, makeItem(unitStr, Qt::AlignCenter));
-    // Col 3: Qty (editable)
-    m_cartTable->setItem(r, 3, makeItem(QString::number(qty), Qt::AlignCenter, true));
-    // Col 4: MRP
-    m_cartTable->setItem(r, 4, makeItem(cartItem.unitMrp.formatted(false), Qt::AlignRight));
 
-    // Col 5: DISC %
-    QString discStr = cartItem.isDiscountable
-        ? (QString::number(cartItem.discountPct, 'f', (std::fmod(cartItem.discountPct, 1.0) == 0.0 ? 0 : 2)) + "%")
-        : "🔒 0%";
-    auto* discItem = makeItem(discStr, Qt::AlignCenter, cartItem.isDiscountable);
-    if (!cartItem.isDiscountable) {
-        discItem->setForeground(QBrush(QColor("#64748B")));
-    } else if (cartItem.discountPct > 0) {
-        discItem->setForeground(QBrush(QColor("#15803D")));
-        discItem->setFont(QFont("", -1, QFont::Bold));
-    }
-    m_cartTable->setItem(r, 5, discItem);
+    // Col 3: BATCH
+    auto* batchItem = makeItem(cartItem.batchNumber, Qt::AlignCenter);
+    m_cartTable->setItem(r, 3, batchItem);
 
-    // Col 6: NET PRICE
-    auto* netItem = makeItem(cartItem.unitSalePrice.formatted(false), Qt::AlignRight, cartItem.isDiscountable);
-    if (!cartItem.isDiscountable) {
-        netItem->setForeground(QBrush(QColor("#64748B")));
-    } else {
-        netItem->setFont(QFont("", -1, QFont::Bold));
-    }
-    m_cartTable->setItem(r, 6, netItem);
-
-    // Col 7: TOTAL
-    auto* totalItem = makeItem(cartItem.totalAmount.formatted(), Qt::AlignRight);
-    totalItem->setFont(QFont("", -1, QFont::Bold));
-    m_cartTable->setItem(r, 7, totalItem);
-
-    // Col 8: BATCH
-    m_cartTable->setItem(r, 8, makeItem(cartItem.batchNumber, Qt::AlignCenter));
-
-    // Col 9: EXPIRY with FEFO visual alert
+    // Col 4: EXPIRY with FEFO visual alert
     QString expiryStr = cartItem.expiryDate.isValid() ? cartItem.expiryDate.toString("MM/yyyy") : "-";
     auto* expItem = makeItem(expiryStr, Qt::AlignCenter);
 
@@ -692,29 +685,73 @@ void SaleWindow::addItemToCart(const domain::Item& item, int qty, domain::SaleUn
             expItem->setText(expiryStr + " ⚠ EXPIRED");
             expItem->setBackground(QBrush(QColor("#FEE2E2")));
             expItem->setForeground(QBrush(QColor("#DC2626")));
-            m_cartTable->item(r, 8)->setBackground(QBrush(QColor("#FEE2E2")));
-            m_cartTable->item(r, 8)->setForeground(QBrush(QColor("#DC2626")));
+            batchItem->setBackground(QBrush(QColor("#FEE2E2")));
+            batchItem->setForeground(QBrush(QColor("#DC2626")));
             AppToast::showWarning(this, QString("⚠ WARNING: %1 is EXPIRED (Batch %2)!").arg(cartItem.itemName, cartItem.batchNumber));
         } else if (daysLeft <= 90) {
             expItem->setText(QString("%1 (%2d left)").arg(expiryStr).arg(daysLeft));
             expItem->setBackground(QBrush(QColor("#FEF3C7")));
             expItem->setForeground(QBrush(QColor("#B45309")));
-            m_cartTable->item(r, 8)->setBackground(QBrush(QColor("#FEF3C7")));
-            m_cartTable->item(r, 8)->setForeground(QBrush(QColor("#B45309")));
+            batchItem->setBackground(QBrush(QColor("#FEF3C7")));
+            batchItem->setForeground(QBrush(QColor("#B45309")));
         }
     }
-    m_cartTable->setItem(r, 9, expItem);
+    m_cartTable->setItem(r, 4, expItem);
+
+    // Col 5: QTY (editable, bold)
+    auto* qtyItem = makeItem(QString::number(qty), Qt::AlignCenter, true);
+    QFont qtyFont = qtyItem->font();
+    qtyFont.setBold(true);
+    qtyItem->setFont(qtyFont);
+    m_cartTable->setItem(r, 5, qtyItem);
+
+    // Col 6: MRP
+    m_cartTable->setItem(r, 6, makeItem(cartItem.unitMrp.formatted(false), Qt::AlignRight));
+
+    // Col 7: DISC %
+    QString discStr = cartItem.isDiscountable
+        ? (QString::number(cartItem.discountPct, 'f', (std::fmod(cartItem.discountPct, 1.0) == 0.0 ? 0 : 2)) + "%")
+        : "🔒 0%";
+    auto* discItem = makeItem(discStr, Qt::AlignCenter, cartItem.isDiscountable);
+    if (!cartItem.isDiscountable) {
+        discItem->setForeground(QBrush(QColor("#64748B")));
+    } else if (cartItem.discountPct > 0) {
+        discItem->setForeground(QBrush(QColor("#15803D")));
+        QFont discFont = discItem->font();
+        discFont.setBold(true);
+        discItem->setFont(discFont);
+    }
+    m_cartTable->setItem(r, 7, discItem);
+
+    // Col 8: SALE PRICE
+    auto* salePriceItem = makeItem(cartItem.unitSalePrice.formatted(false), Qt::AlignRight, cartItem.isDiscountable);
+    if (!cartItem.isDiscountable) {
+        salePriceItem->setForeground(QBrush(QColor("#64748B")));
+    } else {
+        QFont spFont = salePriceItem->font();
+        spFont.setBold(true);
+        salePriceItem->setFont(spFont);
+    }
+    m_cartTable->setItem(r, 8, salePriceItem);
+
+    // Col 9: TOTAL
+    auto* totalItem = makeItem(cartItem.totalAmount.formatted(), Qt::AlignRight);
+    QFont totalFont = totalItem->font();
+    totalFont.setBold(true);
+    totalItem->setFont(totalFont);
+    totalItem->setForeground(QBrush(QColor("#0F766E")));
+    m_cartTable->setItem(r, 9, totalItem);
 
     if (qty < 0) {
         // Wapsi Row styling
         for (int c = 0; c < 10; ++c) {
-            if (c != 3 && c != 5 && c != 6) {
+            if (c != 5 && c != 7 && c != 8) {
                 auto* it = m_cartTable->item(r, c);
-                if (it && c != 9) it->setBackground(QBrush(QColor("#EFF6FF")));
+                if (it && c != 4) it->setBackground(QBrush(QColor("#EFF6FF")));
             }
         }
         m_cartTable->item(r, 1)->setForeground(QBrush(QColor("#1D4ED8")));
-        m_cartTable->item(r, 7)->setForeground(QBrush(QColor("#DC2626")));
+        m_cartTable->item(r, 9)->setForeground(QBrush(QColor("#DC2626")));
     }
 
     m_cartTable->blockSignals(false);
@@ -735,19 +772,46 @@ void SaleWindow::updateTableRow(int row)
 
     m_cartTable->blockSignals(true);
 
+    // Col 0: #
     m_cartTable->item(row, 0)->setText(QString::number(row + 1));
-    m_cartTable->item(row, 1)->setText(cartItem.itemName);
 
+    // Col 1: ITEM NAME (Bold)
+    auto* nameItem = m_cartTable->item(row, 1);
+    nameItem->setText(cartItem.itemName);
+    QFont nameFont = nameItem->font();
+    nameFont.setBold(true);
+    nameItem->setFont(nameFont);
+
+    // Col 2: UNIT
     QString unitStr = "Piece";
     if (cartItem.unitSelection == domain::SaleUnitSelection::Box) unitStr = "Box";
     else if (cartItem.unitSelection == domain::SaleUnitSelection::Strip) unitStr = "Strip";
     else unitStr = "Tablet";
     m_cartTable->item(row, 2)->setText(unitStr);
 
-    m_cartTable->item(row, 3)->setText(QString::number(cartItem.displayQty));
-    m_cartTable->item(row, 4)->setText(cartItem.unitMrp.formatted(false));
+    // Col 3: BATCH
+    m_cartTable->item(row, 3)->setText(cartItem.batchNumber);
 
-    auto* discItem = m_cartTable->item(row, 5);
+    // Col 4: EXPIRY
+    QString expiryStr = cartItem.expiryDate.isValid() ? cartItem.expiryDate.toString("MM/yyyy") : "-";
+    if (cartItem.expiryDate.isValid()) {
+        int daysLeft = QDate::currentDate().daysTo(cartItem.expiryDate);
+        if (daysLeft <= 0) {
+            expiryStr += " ⚠ EXPIRED";
+        } else if (daysLeft <= 90) {
+            expiryStr += QString(" (%1d left)").arg(daysLeft);
+        }
+    }
+    m_cartTable->item(row, 4)->setText(expiryStr);
+
+    // Col 5: QTY
+    m_cartTable->item(row, 5)->setText(QString::number(cartItem.displayQty));
+
+    // Col 6: MRP
+    m_cartTable->item(row, 6)->setText(cartItem.unitMrp.formatted(false));
+
+    // Col 7: DISC %
+    auto* discItem = m_cartTable->item(row, 7);
     if (!cartItem.isDiscountable) {
         discItem->setText("🔒 0%");
         discItem->setForeground(QBrush(QColor("#64748B")));
@@ -757,20 +821,33 @@ void SaleWindow::updateTableRow(int row)
         discItem->setText(pctStr);
         discItem->setForeground(cartItem.discountPct > 0 ? QBrush(QColor("#15803D")) : QBrush(QColor("#1E293B")));
         discItem->setFlags(discItem->flags() | Qt::ItemIsEditable);
+        if (cartItem.discountPct > 0) {
+            QFont discFont = discItem->font();
+            discFont.setBold(true);
+            discItem->setFont(discFont);
+        }
     }
 
-    auto* netItem = m_cartTable->item(row, 6);
-    netItem->setText(cartItem.unitSalePrice.formatted(false));
+    // Col 8: SALE PRICE
+    auto* salePriceItem = m_cartTable->item(row, 8);
+    salePriceItem->setText(cartItem.unitSalePrice.formatted(false));
     if (!cartItem.isDiscountable) {
-        netItem->setForeground(QBrush(QColor("#64748B")));
-        netItem->setFlags(netItem->flags() & ~Qt::ItemIsEditable);
+        salePriceItem->setForeground(QBrush(QColor("#64748B")));
+        salePriceItem->setFlags(salePriceItem->flags() & ~Qt::ItemIsEditable);
     } else {
-        netItem->setForeground(QBrush(QColor("#0F172A")));
-        netItem->setFlags(netItem->flags() | Qt::ItemIsEditable);
+        salePriceItem->setForeground(QBrush(QColor("#0F172A")));
+        salePriceItem->setFlags(salePriceItem->flags() | Qt::ItemIsEditable);
+        QFont spFont = salePriceItem->font();
+        spFont.setBold(true);
+        salePriceItem->setFont(spFont);
     }
 
-    m_cartTable->item(row, 7)->setText(cartItem.totalAmount.formatted());
-    m_cartTable->item(row, 8)->setText(cartItem.batchNumber);
+    // Col 9: TOTAL
+    auto* totalItem = m_cartTable->item(row, 9);
+    totalItem->setText(cartItem.totalAmount.formatted());
+    QFont totalFont = totalItem->font();
+    totalFont.setBold(true);
+    totalItem->setFont(totalFont);
 
     m_cartTable->blockSignals(false);
 }
@@ -816,10 +893,10 @@ void SaleWindow::handleCellChanged(int row, int col)
 {
     if (row < 0 || row >= static_cast<int>(m_cart.size())) return;
 
-    if (col == 3) {
+    if (col == 5) {
         // QTY changed
         bool ok = false;
-        int newQty = m_cartTable->item(row, 3)->text().toInt(&ok);
+        int newQty = m_cartTable->item(row, 5)->text().toInt(&ok);
         if (!ok || newQty == 0) {
             updateTableRow(row);
             return;
@@ -834,7 +911,7 @@ void SaleWindow::handleCellChanged(int row, int col)
         updateTableRow(row);
         updateTotals();
         m_searchBox->setFocus();
-    } else if (col == 5) {
+    } else if (col == 7) {
         // DISC % changed
         if (!m_cart[row].isDiscountable) {
             updateTableRow(row);
@@ -842,7 +919,7 @@ void SaleWindow::handleCellChanged(int row, int col)
             return;
         }
 
-        QString text = m_cartTable->item(row, 5)->text().replace("%", "").trimmed();
+        QString text = m_cartTable->item(row, 7)->text().replace("%", "").trimmed();
         bool ok = false;
         double enteredPct = text.toDouble(&ok);
         if (!ok || enteredPct < 0.0) {
@@ -913,15 +990,15 @@ void SaleWindow::handleCellChanged(int row, int col)
         updateTableRow(row);
         updateTotals();
         m_searchBox->setFocus();
-    } else if (col == 6) {
-        // NET PRICE changed (Reverse calculation)
+    } else if (col == 8) {
+        // SALE PRICE changed (Reverse calculation)
         if (!m_cart[row].isDiscountable) {
             updateTableRow(row);
             AppToast::showWarning(this, QString("🔒 '%1' is Non-Discountable (FMCG / MRP Locked).").arg(m_cart[row].itemName));
             return;
         }
 
-        QString text = m_cartTable->item(row, 6)->text().trimmed();
+        QString text = m_cartTable->item(row, 8)->text().trimmed();
         bool ok = false;
         double enteredPriceRupees = text.toDouble(&ok);
         if (!ok || enteredPriceRupees <= 0.0) {
@@ -1009,8 +1086,8 @@ void SaleWindow::handleQuantityShortcut()
     }
 
     // Zero-Modal Inline Editing: Focus directly into Qty cell
-    m_cartTable->setCurrentCell(row, 3);
-    m_cartTable->editItem(m_cartTable->item(row, 3));
+    m_cartTable->setCurrentCell(row, 5);
+    m_cartTable->editItem(m_cartTable->item(row, 5));
 }
 
 void SaleWindow::handleDiscountShortcut()

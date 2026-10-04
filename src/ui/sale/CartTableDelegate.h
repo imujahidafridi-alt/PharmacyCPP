@@ -28,14 +28,14 @@ public:
         const auto& item = cart[row];
 
         // EDGE CASE 1: The "Non-Discountable" Lock (FMCG / Cosmetics / Baby Milk)
-        // Strictly block inline editing of Discount % (Col 5) and Net Price (Col 6) for FMCG items
-        if ((col == 5 || col == 6) && !item.isDiscountable) {
+        // Strictly block inline editing of Discount % (Col 7) and Sale Price (Col 8) for FMCG items
+        if ((col == 7 || col == 8) && !item.isDiscountable) {
             emit nonDiscountableBlocked(item.itemName);
             return nullptr; // Hard block: no editor created!
         }
 
         auto* editor = new QLineEdit(parent);
-        editor->setAlignment(col == 6 ? (Qt::AlignRight | Qt::AlignVCenter) : Qt::AlignCenter);
+        editor->setAlignment(col == 8 ? (Qt::AlignRight | Qt::AlignVCenter) : Qt::AlignCenter);
         editor->setStyleSheet(
             "QLineEdit {"
             "  background-color: #FFFFFF;"
@@ -48,11 +48,11 @@ public:
             "}"
         );
 
-        if (col == 3) {
+        if (col == 5) {
             editor->setValidator(new QIntValidator(-9999, 9999, editor));
-        } else if (col == 5) {
+        } else if (col == 7) {
             editor->setValidator(new QDoubleValidator(0.0, 100.0, 2, editor));
-        } else if (col == 6) {
+        } else if (col == 8) {
             editor->setValidator(new QDoubleValidator(0.0, 999999.0, 2, editor));
         }
 
@@ -69,11 +69,11 @@ public:
         if (row < 0 || row >= static_cast<int>(cart.size())) return;
         const auto& item = cart[row];
 
-        if (col == 3) {
+        if (col == 5) {
             lineEdit->setText(QString::number(item.displayQty));
-        } else if (col == 5) {
+        } else if (col == 7) {
             lineEdit->setText(QString::number(item.discountPct, 'f', (std::fmod(item.discountPct, 1.0) == 0.0 ? 0 : 2)));
-        } else if (col == 6) {
+        } else if (col == 8) {
             lineEdit->setText(item.unitSalePrice.formatted(false));
         }
         lineEdit->selectAll();
