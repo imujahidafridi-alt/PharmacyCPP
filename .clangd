@@ -1,6 +1,17 @@
 CompileFlags:
   CompilationDatabase: "."
+  Compiler: "C:/msys64/ucrt64/bin/g++.exe"
   Add:
+    - "--target=x86_64-w64-mingw32"
+    - "-std=c++20"
+    - "-DMINGW_HAS_SECURE_API=1"
+    - "-DQT_CORE_LIB"
+    - "-DQT_GUI_LIB"
+    - "-DQT_WIDGETS_LIB"
+    - "-DQT_SQL_LIB"
+    - "-DQT_PRINTSUPPORT_LIB"
+    - "-DUNICODE"
+    - "-D_UNICODE"
     - "-isystem"
     - "C:/msys64/ucrt64/include/c++/16.1.0"
     - "-isystem"
