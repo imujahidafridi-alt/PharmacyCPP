@@ -25,6 +25,10 @@ PosSearchPopup::PosSearchPopup(QWidget* parent)
             border: 1.5px solid #0F766E;
             border-radius: 4px;
         }
+        PosSearchPopup DataTable {
+            border: none;
+            border-radius: 0px;
+        }
     )");
 
     auto* layout = new QVBoxLayout(this);
@@ -34,11 +38,39 @@ PosSearchPopup::PosSearchPopup(QWidget* parent)
     m_table = new DataTable(this);
     m_table->setupHeaders({"PRODUCT (BRAND)", "GENERIC FORMULA", "PACKING", "PRICE", "STOCK"});
     m_table->setFocusPolicy(Qt::NoFocus);
+    m_table->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_table->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+
+    // Disable automatic stretching of last section so STOCK doesn't expand indefinitely
+    m_table->horizontalHeader()->setStretchLastSection(false);
+
+    // Column 0 (Product): Stretches to fill remaining space
     m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    m_table->setColumnWidth(1, 160);
-    m_table->setColumnWidth(2, 95);
-    m_table->setColumnWidth(3, 85);
-    m_table->setColumnWidth(4, 90);
+
+    // Column 1 (Generic Formula): Generous width (280px) so compound formulas are never truncated
+    m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Fixed);
+    m_table->setColumnWidth(1, 280);
+
+    // Column 2 (Packing): Centered, 110px
+    m_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
+    m_table->setColumnWidth(2, 110);
+
+    // Column 3 (Price): Right-aligned, 100px
+    m_table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
+    m_table->setColumnWidth(3, 100);
+
+    // Column 4 (Stock): Centered badge, 120px
+    m_table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Fixed);
+    m_table->setColumnWidth(4, 120);
+
+    // Align column header titles to match the data content alignment perfectly:
+    if (auto* h0 = m_table->horizontalHeaderItem(0)) h0->setTextAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    if (auto* h1 = m_table->horizontalHeaderItem(1)) h1->setTextAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    if (auto* h2 = m_table->horizontalHeaderItem(2)) h2->setTextAlignment(Qt::AlignCenter);
+    if (auto* h3 = m_table->horizontalHeaderItem(3)) h3->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    if (auto* h4 = m_table->horizontalHeaderItem(4)) h4->setTextAlignment(Qt::AlignCenter);
+
+    m_table->verticalHeader()->setDefaultSectionSize(30);
 
     layout->addWidget(m_table);
 
@@ -122,11 +154,11 @@ void PosSearchPopup::setResults(const std::vector<SearchResultItem>& results)
         m_table->selectRow(0);
     }
 
-    int rowHeight = 28;
+    int rowHeight = 30;
     int headerHeight = m_table->horizontalHeader()->height();
-    if (headerHeight < 24) headerHeight = 28;
+    if (headerHeight < 28) headerHeight = 28;
     int calculatedHeight = static_cast<int>(results.size()) * rowHeight + headerHeight + 6;
-    setFixedHeight(std::min(calculatedHeight, 300));
+    setFixedHeight(std::min(calculatedHeight, 340));
 }
 
 bool PosSearchPopup::hasSelection() const
@@ -272,7 +304,7 @@ void PosSearchBox::updatePopupPosition()
     if (!m_popup) return;
     
     QPoint globalPos = mapToGlobal(QPoint(0, height() + 1));
-    int popupWidth = std::max(width(), 700);
+    int popupWidth = std::max(width(), 780);
     int popupHeight = m_popup->height();
 
     // Check screen bounds to prevent clipping off the bottom
