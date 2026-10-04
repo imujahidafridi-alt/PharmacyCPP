@@ -43,6 +43,7 @@ private slots:
 
 private:
     void addItemToCart(const domain::Item& item, int qty = 1, domain::SaleUnitSelection unit = domain::SaleUnitSelection::PieceOrTablet);
+    void updateTableRow(int row);
     void promptAddItem(const QString& queryOrBarcode);
     void updateCustomerDisplay();
     void updateEmptyState();

@@ -28,6 +28,7 @@ set(SOURCES
     src/database/Migrations.cpp
     src/services/StockService.cpp
     src/services/SaleService.cpp
+    src/services/PriceCalculator.cpp
     src/services/PurchaseService.cpp
     src/services/LedgerService.cpp
     src/services/ReturnService.cpp
@@ -81,6 +82,7 @@ set(HEADERS
     src/database/Migrations.h
     src/services/StockService.h
     src/services/SaleService.h
+    src/services/PriceCalculator.h
     src/services/PurchaseService.h
     src/services/LedgerService.h
     src/services/ReturnService.h
@@ -99,6 +101,7 @@ set(HEADERS
     src/ui/components/AppToast.h
     src/ui/components/ReceiptPreviewDialog.h
     src/ui/sale/SaleWindow.h
+    src/ui/sale/CartTableDelegate.h
     src/ui/sale/PaymentDialog.h
     src/ui/sale/HoldBillsDialog.h
     src/ui/items/ItemsWindow.h
@@ -147,6 +150,7 @@ set(TEST_SOURCES
     src/database/Migrations.cpp
     src/services/StockService.cpp
     src/services/SaleService.cpp
+    src/services/PriceCalculator.cpp
     src/services/PurchaseService.cpp
     src/services/LedgerService.cpp
     src/services/ReturnService.cpp

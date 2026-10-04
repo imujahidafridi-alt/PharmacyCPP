@@ -1,7 +1,8 @@
 #include "ui/sale/SaleWindow.h"
 #include "ui/sale/PaymentDialog.h"
 #include "ui/sale/HoldBillsDialog.h"
-#include "ui/sale/CartQtyDelegate.h"
+#include "ui/sale/CartTableDelegate.h"
+#include "services/PriceCalculator.h"
 #include "ui/items/QuickAddItemDialog.h"
 #include "ui/components/AppToast.h"
 #include "services/SaleService.h"
@@ -94,22 +95,32 @@ SaleWindow::SaleWindow(QWidget* parent) : QWidget(parent)
     tableLayout->setContentsMargins(0, 0, 0, 0);
 
     m_cartTable = new DataTable(tableContainer);
-    m_cartTable->setupHeaders({"#", "ITEM NAME", "UNIT", "QTY (F2)", "PRICE", "TOTAL", "BATCH", "EXPIRY"});
+    m_cartTable->setupHeaders({"#", "ITEM NAME", "UNIT", "QTY (F2)", "MRP", "DISC %", "NET PRICE", "TOTAL", "BATCH", "EXPIRY"});
     m_cartTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-    m_cartTable->setColumnWidth(0, 36);
-    m_cartTable->setColumnWidth(2, 70);
-    m_cartTable->setColumnWidth(3, 75); // Qty inline editor column
-    m_cartTable->setColumnWidth(4, 85);
-    m_cartTable->setColumnWidth(5, 95);
-    m_cartTable->setColumnWidth(6, 85);
-    m_cartTable->setColumnWidth(7, 100);
+    m_cartTable->setColumnWidth(0, 32);
+    m_cartTable->setColumnWidth(2, 60);
+    m_cartTable->setColumnWidth(3, 65); // Qty inline editor
+    m_cartTable->setColumnWidth(4, 75); // MRP
+    m_cartTable->setColumnWidth(5, 70); // Disc % inline editor
+    m_cartTable->setColumnWidth(6, 80); // Net Price inline editor
+    m_cartTable->setColumnWidth(7, 90); // Line Total
+    m_cartTable->setColumnWidth(8, 75); // Batch
+    m_cartTable->setColumnWidth(9, 85); // Expiry
 
-    // Install custom inline editor delegate on Qty column (zero modal popups!)
-    auto* qtyDelegate = new CartQtyDelegate(this);
-    m_cartTable->setItemDelegateForColumn(3, qtyDelegate);
+    // Install custom inline editor delegate on Qty (3), Disc % (5), and Net Price (6) columns
+    auto* cartDelegate = new CartTableDelegate([this]() -> const std::vector<domain::CartItem>& {
+        return m_cart;
+    }, this);
+    m_cartTable->setItemDelegateForColumn(3, cartDelegate);
+    m_cartTable->setItemDelegateForColumn(5, cartDelegate);
+    m_cartTable->setItemDelegateForColumn(6, cartDelegate);
     m_cartTable->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed | QAbstractItemView::SelectedClicked);
     m_cartTable->installEventFilter(this);
-    connect(qtyDelegate, &QAbstractItemDelegate::closeEditor, this, [this]() {
+
+    connect(cartDelegate, &CartTableDelegate::nonDiscountableBlocked, this, [this](const QString& itemName) {
+        AppToast::showWarning(this, QString("🔒 '%1' is Non-Discountable (FMCG / Regulated MRP).").arg(itemName));
+    });
+    connect(cartDelegate, &QAbstractItemDelegate::closeEditor, this, [this]() {
         m_searchBox->setFocus();
     });
 
@@ -278,10 +289,11 @@ SaleWindow::SaleWindow(QWidget* parent) : QWidget(parent)
     connect(m_cartTable, &QTableWidget::cellChanged, this, &SaleWindow::handleCellChanged);
 
     connect(m_cartTable, &QTableWidget::cellDoubleClicked, this, [this](int row, int col) {
+        if (row < 0 || row >= static_cast<int>(m_cart.size())) return;
         if (col == 2) {
             handleUnitToggleShortcut();
-        } else if (col == 3) {
-            handleQuantityShortcut();
+        } else if ((col == 5 || col == 6) && !m_cart[row].isDiscountable) {
+            AppToast::showWarning(this, QString("🔒 '%1' is Non-Discountable (FMCG / MRP Locked).").arg(m_cart[row].itemName));
         }
     });
 
@@ -292,20 +304,47 @@ SaleWindow::SaleWindow(QWidget* parent) : QWidget(parent)
             auto& dbMgr = database::DatabaseManager::instance();
             QSqlDatabase db = dbMgr.connection();
             QSqlQuery q(db);
-            q.prepare("SELECT * FROM items WHERE id = ?");
+            q.prepare(R"(
+                SELECT i.*, c.name as category_name,
+                       COALESCE(c.is_discountable, 1) as cat_is_discountable,
+                       COALESCE(c.default_disc_pct, 0.0) as cat_default_disc_pct,
+                       COALESCE(c.max_discount_pct, 15.0) as cat_max_disc_pct
+                FROM items i
+                LEFT JOIN categories c ON i.category_id = c.id
+                WHERE i.id = ?
+            )");
             q.addBindValue(subItemId);
             if (q.exec() && q.next()) {
                 domain::Item subItem;
                 subItem.id = q.value("id").toInt();
                 subItem.code = q.value("code").toString();
                 subItem.name = q.value("name").toString();
+                subItem.categoryId = q.value("category_id").toInt();
+                subItem.categoryName = q.value("category_name").toString();
                 subItem.brand = q.value("brand").toString();
                 subItem.salePrice = core::Money::fromPaisa(q.value("sale_price_paisa").toLongLong());
+                subItem.purchaseCost = core::Money::fromPaisa(q.value("purchase_cost_paisa").toLongLong());
+                int64_t tpVal = q.value("tp_paisa").toLongLong();
+                subItem.tp = (tpVal > 0) ? core::Money::fromPaisa(tpVal) : subItem.purchaseCost;
                 subItem.isMedicine = (q.value("is_medicine").toInt() == 1);
                 subItem.piecesPerStrip = q.value("pieces_per_strip").toInt();
                 subItem.stripsPerBox = q.value("strips_per_box").toInt();
                 subItem.stripSalePrice = core::Money::fromPaisa(q.value("strip_sale_price_paisa").toLongLong());
                 subItem.boxSalePrice = core::Money::fromPaisa(q.value("box_sale_price_paisa").toLongLong());
+
+                subItem.categoryDiscountable = (q.value("cat_is_discountable").toInt() == 1);
+                subItem.categoryDefaultDiscountPct = q.value("cat_default_disc_pct").toDouble();
+                subItem.categoryMaxDiscountPct = q.value("cat_max_disc_pct").toDouble();
+                if (subItem.categoryMaxDiscountPct <= 0.0 && subItem.categoryDiscountable) {
+                    subItem.categoryMaxDiscountPct = 15.0;
+                }
+                if (!q.value("item_is_discountable").isNull()) {
+                    subItem.isDiscountableOverride = (q.value("item_is_discountable").toInt() == 1);
+                }
+                if (!q.value("override_disc_pct").isNull()) {
+                    subItem.discountPctOverride = q.value("override_disc_pct").toDouble();
+                }
+                subItem.minMarginPct = q.value("min_margin_pct").toDouble();
 
                 addItemToCart(subItem);
                 AppToast::showSuccess(this, QString("Substituted '%1' into cart!").arg(subItem.name));
@@ -385,7 +424,10 @@ void SaleWindow::handleCommandEntered(const ui::PosSearchBox::ParsedCommand& cmd
 
     if (cmd.isBarcode) {
         q.prepare(R"(
-            SELECT i.*, c.name as category_name
+            SELECT i.*, c.name as category_name,
+                   COALESCE(c.is_discountable, 1) as cat_is_discountable,
+                   COALESCE(c.default_disc_pct, 0.0) as cat_default_disc_pct,
+                   COALESCE(c.max_discount_pct, 15.0) as cat_max_disc_pct
             FROM items i
             LEFT JOIN categories c ON i.category_id = c.id
             LEFT JOIN item_barcodes ib ON i.id = ib.item_id
@@ -399,7 +441,10 @@ void SaleWindow::handleCommandEntered(const ui::PosSearchBox::ParsedCommand& cmd
     } else {
         // 1. Try exact name or code match first (essential when selected from dropdown!)
         q.prepare(R"(
-            SELECT i.*, c.name as category_name
+            SELECT i.*, c.name as category_name,
+                   COALESCE(c.is_discountable, 1) as cat_is_discountable,
+                   COALESCE(c.default_disc_pct, 0.0) as cat_default_disc_pct,
+                   COALESCE(c.max_discount_pct, 15.0) as cat_max_disc_pct
             FROM items i
             LEFT JOIN categories c ON i.category_id = c.id
             WHERE (i.name = ? OR i.code = ?) AND i.is_active = 1
@@ -412,7 +457,10 @@ void SaleWindow::handleCommandEntered(const ui::PosSearchBox::ParsedCommand& cmd
         if (!found) {
             // 2. Fallback to fuzzy search
             q.prepare(R"(
-                SELECT i.*, c.name as category_name
+                SELECT i.*, c.name as category_name,
+                       COALESCE(c.is_discountable, 1) as cat_is_discountable,
+                       COALESCE(c.default_disc_pct, 0.0) as cat_default_disc_pct,
+                       COALESCE(c.max_discount_pct, 15.0) as cat_max_disc_pct
                 FROM items i
                 LEFT JOIN categories c ON i.category_id = c.id
                 WHERE (i.name LIKE ? OR i.code LIKE ? OR i.generic_name LIKE ?) AND i.is_active = 1
@@ -431,15 +479,34 @@ void SaleWindow::handleCommandEntered(const ui::PosSearchBox::ParsedCommand& cmd
         item.id = q.value("id").toInt();
         item.code = q.value("code").toString();
         item.name = q.value("name").toString();
+        item.categoryId = q.value("category_id").toInt();
         item.categoryName = q.value("category_name").toString();
         item.brand = q.value("brand").toString();
         item.genericName = q.value("generic_name").toString();
+        item.barcode = q.value("barcode").toString();
         item.salePrice = core::Money::fromPaisa(q.value("sale_price_paisa").toLongLong());
+        item.purchaseCost = core::Money::fromPaisa(q.value("purchase_cost_paisa").toLongLong());
+        int64_t tpVal = q.value("tp_paisa").toLongLong();
+        item.tp = (tpVal > 0) ? core::Money::fromPaisa(tpVal) : item.purchaseCost;
         item.isMedicine = (q.value("is_medicine").toInt() == 1);
         item.piecesPerStrip = q.value("pieces_per_strip").toInt();
         item.stripsPerBox = q.value("strips_per_box").toInt();
         item.stripSalePrice = core::Money::fromPaisa(q.value("strip_sale_price_paisa").toLongLong());
         item.boxSalePrice = core::Money::fromPaisa(q.value("box_sale_price_paisa").toLongLong());
+
+        item.categoryDiscountable = (q.value("cat_is_discountable").toInt() == 1);
+        item.categoryDefaultDiscountPct = q.value("cat_default_disc_pct").toDouble();
+        item.categoryMaxDiscountPct = q.value("cat_max_disc_pct").toDouble();
+        if (item.categoryMaxDiscountPct <= 0.0 && item.categoryDiscountable) {
+            item.categoryMaxDiscountPct = 15.0;
+        }
+        if (!q.value("item_is_discountable").isNull()) {
+            item.isDiscountableOverride = (q.value("item_is_discountable").toInt() == 1);
+        }
+        if (!q.value("override_disc_pct").isNull()) {
+            item.discountPctOverride = q.value("override_disc_pct").toDouble();
+        }
+        item.minMarginPct = q.value("min_margin_pct").toDouble();
 
         domain::SaleUnitSelection unit = cmd.hasExplicitUnit ? cmd.unit : domain::SaleUnitSelection::PieceOrTablet;
         addItemToCart(item, cmd.qty, unit);
@@ -475,47 +542,80 @@ void SaleWindow::handleSearchEntered(const QString& text)
 
 void SaleWindow::addItemToCart(const domain::Item& item, int qty, domain::SaleUnitSelection unit)
 {
+    core::Money uMrp = item.salePrice;
+    core::Money uTp = item.tp.isPositive() ? item.tp : item.purchaseCost;
+    int atomicPerUnit = 1;
+    QString unitStr = item.isMedicine ? "Tablet" : "Piece";
+
+    if (unit == domain::SaleUnitSelection::Box && item.stripsPerBox > 1) {
+        atomicPerUnit = item.stripsPerBox * item.piecesPerStrip;
+        uMrp = item.boxSalePrice.isPositive() ? item.boxSalePrice : (item.salePrice * atomicPerUnit);
+        uTp = (item.tp.isPositive() ? item.tp : item.purchaseCost) * atomicPerUnit;
+        unitStr = "Box";
+    } else if (unit == domain::SaleUnitSelection::Strip && item.piecesPerStrip > 1) {
+        atomicPerUnit = item.piecesPerStrip;
+        uMrp = item.stripSalePrice.isPositive() ? item.stripSalePrice : (item.salePrice * atomicPerUnit);
+        uTp = (item.tp.isPositive() ? item.tp : item.purchaseCost) * atomicPerUnit;
+        unitStr = "Strip";
+    }
+
     // Don't merge returns into regular positive lines
     for (size_t i = 0; i < m_cart.size(); ++i) {
         if (m_cart[i].itemId == item.id && m_cart[i].unitSelection == unit && ((m_cart[i].displayQty > 0 && qty > 0) || (m_cart[i].displayQty < 0 && qty < 0))) {
             m_cart[i].displayQty += qty;
             m_cart[i].totalAtomicQty = m_cart[i].displayQty * m_cart[i].atomicUnitsPerQty;
-            m_cart[i].totalAmount = m_cart[i].unitPrice * m_cart[i].displayQty;
-            
-            m_cartTable->blockSignals(true);
-            m_cartTable->item(i, 3)->setText(QString::number(m_cart[i].displayQty));
-            m_cartTable->item(i, 5)->setText(m_cart[i].totalAmount.formatted());
-            m_cartTable->blockSignals(false);
 
+            auto comp = services::PriceCalculator::calculateRowTotals(
+                item,
+                item.categoryDiscountable,
+                item.categoryDefaultDiscountPct,
+                item.categoryMaxDiscountPct,
+                m_cart[i].displayQty,
+                m_cart[i].discountPct,
+                m_cart[i].unitMrp,
+                m_cart[i].unitTp
+            );
+            m_cart[i].totalGross = comp.totalGross;
+            m_cart[i].totalDiscount = comp.totalDiscount;
+            m_cart[i].totalAmount = comp.totalAmount;
+
+            updateTableRow(static_cast<int>(i));
             updateTotals();
             return;
         }
     }
 
-    core::Money uPrice = item.salePrice;
-    int atomicPerUnit = 1;
-    QString unitStr = item.isMedicine ? "Tablet" : "Piece";
-
-    if (unit == domain::SaleUnitSelection::Box && item.stripsPerBox > 1) {
-        uPrice = item.boxSalePrice.isPositive() ? item.boxSalePrice : (item.salePrice * (item.stripsPerBox * item.piecesPerStrip));
-        atomicPerUnit = item.stripsPerBox * item.piecesPerStrip;
-        unitStr = "Box";
-    } else if (unit == domain::SaleUnitSelection::Strip && item.piecesPerStrip > 1) {
-        uPrice = item.stripSalePrice.isPositive() ? item.stripSalePrice : (item.salePrice * item.piecesPerStrip);
-        atomicPerUnit = item.piecesPerStrip;
-        unitStr = "Strip";
-    }
+    auto comp = services::PriceCalculator::calculateRowTotals(
+        item,
+        item.categoryDiscountable,
+        item.categoryDefaultDiscountPct,
+        item.categoryMaxDiscountPct,
+        qty,
+        -1.0, // Inherit default discount
+        uMrp,
+        uTp
+    );
 
     auto fefoRes = services::StockService::instance().allocateFefo(item.id, std::abs(qty) * atomicPerUnit);
     domain::CartItem cartItem;
     cartItem.itemId = item.id;
     cartItem.itemName = (qty < 0) ? (item.name + " [WAPSI / RETURN]") : item.name;
+    cartItem.barcode = item.barcode;
     cartItem.unitSelection = unit;
     cartItem.displayQty = qty;
     cartItem.atomicUnitsPerQty = atomicPerUnit;
     cartItem.totalAtomicQty = qty * atomicPerUnit;
-    cartItem.unitPrice = uPrice;
-    cartItem.totalAmount = uPrice * qty;
+
+    cartItem.unitMrp = comp.unitMrp;
+    cartItem.unitTp = comp.unitTp;
+    cartItem.isDiscountable = comp.isDiscountable;
+    cartItem.discountPct = comp.discountPct;
+    cartItem.unitDiscount = comp.unitDiscount;
+    cartItem.unitSalePrice = comp.unitSalePrice;
+    cartItem.unitPrice = comp.unitSalePrice;
+    cartItem.totalGross = comp.totalGross;
+    cartItem.totalDiscount = comp.totalDiscount;
+    cartItem.totalAmount = comp.totalAmount;
 
     if (fefoRes.isOk() && !fefoRes.value().empty()) {
         const auto& alloc = fefoRes.value().front();
@@ -541,54 +641,138 @@ void SaleWindow::addItemToCart(const domain::Item& item, int qty, domain::SaleUn
         return it;
     };
 
+    // Col 0: #
     m_cartTable->setItem(r, 0, makeItem(QString::number(r + 1), Qt::AlignCenter));
+    // Col 1: Name
     m_cartTable->setItem(r, 1, makeItem(cartItem.itemName));
+    // Col 2: Unit
     m_cartTable->setItem(r, 2, makeItem(unitStr, Qt::AlignCenter));
-    m_cartTable->setItem(r, 3, makeItem(QString::number(qty), Qt::AlignCenter, true)); // Column 3: QTY inline editable
-    m_cartTable->setItem(r, 4, makeItem(uPrice.formatted(false), Qt::AlignRight));
-    m_cartTable->setItem(r, 5, makeItem(cartItem.totalAmount.formatted(), Qt::AlignRight));
-    m_cartTable->setItem(r, 6, makeItem(cartItem.batchNumber, Qt::AlignCenter));
-    
-    // FEFO Expiry Alert Visual Formatting
+    // Col 3: Qty (editable)
+    m_cartTable->setItem(r, 3, makeItem(QString::number(qty), Qt::AlignCenter, true));
+    // Col 4: MRP
+    m_cartTable->setItem(r, 4, makeItem(cartItem.unitMrp.formatted(false), Qt::AlignRight));
+
+    // Col 5: DISC %
+    QString discStr = cartItem.isDiscountable
+        ? (QString::number(cartItem.discountPct, 'f', (std::fmod(cartItem.discountPct, 1.0) == 0.0 ? 0 : 2)) + "%")
+        : "🔒 0%";
+    auto* discItem = makeItem(discStr, Qt::AlignCenter, cartItem.isDiscountable);
+    if (!cartItem.isDiscountable) {
+        discItem->setForeground(QBrush(QColor("#64748B")));
+    } else if (cartItem.discountPct > 0) {
+        discItem->setForeground(QBrush(QColor("#15803D")));
+        discItem->setFont(QFont("", -1, QFont::Bold));
+    }
+    m_cartTable->setItem(r, 5, discItem);
+
+    // Col 6: NET PRICE
+    auto* netItem = makeItem(cartItem.unitSalePrice.formatted(false), Qt::AlignRight, cartItem.isDiscountable);
+    if (!cartItem.isDiscountable) {
+        netItem->setForeground(QBrush(QColor("#64748B")));
+    } else {
+        netItem->setFont(QFont("", -1, QFont::Bold));
+    }
+    m_cartTable->setItem(r, 6, netItem);
+
+    // Col 7: TOTAL
+    auto* totalItem = makeItem(cartItem.totalAmount.formatted(), Qt::AlignRight);
+    totalItem->setFont(QFont("", -1, QFont::Bold));
+    m_cartTable->setItem(r, 7, totalItem);
+
+    // Col 8: BATCH
+    m_cartTable->setItem(r, 8, makeItem(cartItem.batchNumber, Qt::AlignCenter));
+
+    // Col 9: EXPIRY with FEFO visual alert
     QString expiryStr = cartItem.expiryDate.isValid() ? cartItem.expiryDate.toString("MM/yyyy") : "-";
     auto* expItem = makeItem(expiryStr, Qt::AlignCenter);
-    
+
     if (cartItem.expiryDate.isValid()) {
         int daysLeft = QDate::currentDate().daysTo(cartItem.expiryDate);
         if (daysLeft <= 0) {
             expItem->setText(expiryStr + " ⚠ EXPIRED");
             expItem->setBackground(QBrush(QColor("#FEE2E2")));
             expItem->setForeground(QBrush(QColor("#DC2626")));
-            m_cartTable->item(r, 6)->setBackground(QBrush(QColor("#FEE2E2")));
-            m_cartTable->item(r, 6)->setForeground(QBrush(QColor("#DC2626")));
+            m_cartTable->item(r, 8)->setBackground(QBrush(QColor("#FEE2E2")));
+            m_cartTable->item(r, 8)->setForeground(QBrush(QColor("#DC2626")));
             AppToast::showWarning(this, QString("⚠ WARNING: %1 is EXPIRED (Batch %2)!").arg(cartItem.itemName, cartItem.batchNumber));
         } else if (daysLeft <= 90) {
             expItem->setText(QString("%1 (%2d left)").arg(expiryStr).arg(daysLeft));
             expItem->setBackground(QBrush(QColor("#FEF3C7")));
             expItem->setForeground(QBrush(QColor("#B45309")));
-            m_cartTable->item(r, 6)->setBackground(QBrush(QColor("#FEF3C7")));
-            m_cartTable->item(r, 6)->setForeground(QBrush(QColor("#B45309")));
+            m_cartTable->item(r, 8)->setBackground(QBrush(QColor("#FEF3C7")));
+            m_cartTable->item(r, 8)->setForeground(QBrush(QColor("#B45309")));
         }
     }
+    m_cartTable->setItem(r, 9, expItem);
 
     if (qty < 0) {
         // Wapsi Row styling
-        for (int c = 0; c < 8; ++c) {
-            if (c != 3) { // keep qty editable
+        for (int c = 0; c < 10; ++c) {
+            if (c != 3 && c != 5 && c != 6) {
                 auto* it = m_cartTable->item(r, c);
-                if (it && c != 7) it->setBackground(QBrush(QColor("#EFF6FF")));
+                if (it && c != 9) it->setBackground(QBrush(QColor("#EFF6FF")));
             }
         }
         m_cartTable->item(r, 1)->setForeground(QBrush(QColor("#1D4ED8")));
-        m_cartTable->item(r, 5)->setForeground(QBrush(QColor("#DC2626")));
+        m_cartTable->item(r, 7)->setForeground(QBrush(QColor("#DC2626")));
     }
 
-    m_cartTable->setItem(r, 7, expItem);
     m_cartTable->blockSignals(false);
-
     m_cartTable->selectRow(r);
+
+    if (comp.wasClampedDueToLoss) {
+        AppToast::showWarning(this, QString("⚠ Margin Protection: %1 discount clamped to preserve Trade Price.").arg(item.name));
+    }
+
     updateTotals();
     updateEmptyState();
+}
+
+void SaleWindow::updateTableRow(int row)
+{
+    if (row < 0 || row >= static_cast<int>(m_cart.size()) || row >= m_cartTable->rowCount()) return;
+    const auto& cartItem = m_cart[row];
+
+    m_cartTable->blockSignals(true);
+
+    m_cartTable->item(row, 0)->setText(QString::number(row + 1));
+    m_cartTable->item(row, 1)->setText(cartItem.itemName);
+
+    QString unitStr = "Piece";
+    if (cartItem.unitSelection == domain::SaleUnitSelection::Box) unitStr = "Box";
+    else if (cartItem.unitSelection == domain::SaleUnitSelection::Strip) unitStr = "Strip";
+    else unitStr = "Tablet";
+    m_cartTable->item(row, 2)->setText(unitStr);
+
+    m_cartTable->item(row, 3)->setText(QString::number(cartItem.displayQty));
+    m_cartTable->item(row, 4)->setText(cartItem.unitMrp.formatted(false));
+
+    auto* discItem = m_cartTable->item(row, 5);
+    if (!cartItem.isDiscountable) {
+        discItem->setText("🔒 0%");
+        discItem->setForeground(QBrush(QColor("#64748B")));
+        discItem->setFlags(discItem->flags() & ~Qt::ItemIsEditable);
+    } else {
+        QString pctStr = QString::number(cartItem.discountPct, 'f', (std::fmod(cartItem.discountPct, 1.0) == 0.0 ? 0 : 2)) + "%";
+        discItem->setText(pctStr);
+        discItem->setForeground(cartItem.discountPct > 0 ? QBrush(QColor("#15803D")) : QBrush(QColor("#1E293B")));
+        discItem->setFlags(discItem->flags() | Qt::ItemIsEditable);
+    }
+
+    auto* netItem = m_cartTable->item(row, 6);
+    netItem->setText(cartItem.unitSalePrice.formatted(false));
+    if (!cartItem.isDiscountable) {
+        netItem->setForeground(QBrush(QColor("#64748B")));
+        netItem->setFlags(netItem->flags() & ~Qt::ItemIsEditable);
+    } else {
+        netItem->setForeground(QBrush(QColor("#0F172A")));
+        netItem->setFlags(netItem->flags() | Qt::ItemIsEditable);
+    }
+
+    m_cartTable->item(row, 7)->setText(cartItem.totalAmount.formatted());
+    m_cartTable->item(row, 8)->setText(cartItem.batchNumber);
+
+    m_cartTable->blockSignals(false);
 }
 
 void SaleWindow::promptAddItem(const QString& queryOrBarcode)
@@ -604,40 +788,208 @@ void SaleWindow::promptAddItem(const QString& queryOrBarcode)
 
 void SaleWindow::updateTotals()
 {
-    core::Money subtotal;
+    core::Money grossTotal;
+    core::Money totalLineDiscount;
+    core::Money netTotal;
     int totalLines = 0;
     int totalUnits = 0;
 
     for (const auto& it : m_cart) {
-        subtotal += it.totalAmount;
+        grossTotal += it.totalGross;
+        totalLineDiscount += it.totalDiscount;
+        netTotal += it.totalAmount;
         totalLines++;
         totalUnits += it.displayQty;
     }
 
-    core::Money grandTotal = subtotal - m_discount;
+    core::Money grandTotal = netTotal - m_discount;
     if (grandTotal.isNegative()) grandTotal = core::Money(0);
+    core::Money totalAllDiscount = totalLineDiscount + m_discount;
 
     m_itemCountLabel->setText(QString("Lines: %1 | Qty: %2").arg(totalLines).arg(totalUnits));
-    m_subtotalLabel->setText(QString("Subtotal: %1").arg(subtotal.formatted()));
-    m_discountLabel->setText(QString("Discount: %1").arg(m_discount.formatted()));
+    m_subtotalLabel->setText(QString("Subtotal: %1").arg(grossTotal.formatted()));
+    m_discountLabel->setText(QString("Discount: %1").arg(totalAllDiscount.formatted()));
     m_totalLabel->setText(grandTotal.formatted());
 }
 
 void SaleWindow::handleCellChanged(int row, int col)
 {
-    if (col != 3 || row < 0 || row >= static_cast<int>(m_cart.size())) return;
+    if (row < 0 || row >= static_cast<int>(m_cart.size())) return;
 
-    bool ok = false;
-    int newQty = m_cartTable->item(row, 3)->text().toInt(&ok);
-    if (ok && newQty != 0) {
+    if (col == 3) {
+        // QTY changed
+        bool ok = false;
+        int newQty = m_cartTable->item(row, 3)->text().toInt(&ok);
+        if (!ok || newQty == 0) {
+            updateTableRow(row);
+            return;
+        }
+
         m_cart[row].displayQty = newQty;
         m_cart[row].totalAtomicQty = newQty * m_cart[row].atomicUnitsPerQty;
-        m_cart[row].totalAmount = m_cart[row].unitPrice * newQty;
+        m_cart[row].totalGross = m_cart[row].unitMrp * newQty;
+        m_cart[row].totalDiscount = m_cart[row].unitDiscount * newQty;
+        m_cart[row].totalAmount = m_cart[row].unitSalePrice * newQty;
 
-        m_cartTable->blockSignals(true);
-        m_cartTable->item(row, 5)->setText(m_cart[row].totalAmount.formatted());
-        m_cartTable->blockSignals(false);
+        updateTableRow(row);
+        updateTotals();
+        m_searchBox->setFocus();
+    } else if (col == 5) {
+        // DISC % changed
+        if (!m_cart[row].isDiscountable) {
+            updateTableRow(row);
+            AppToast::showWarning(this, QString("🔒 '%1' is Non-Discountable (FMCG / MRP Locked).").arg(m_cart[row].itemName));
+            return;
+        }
 
+        QString text = m_cartTable->item(row, 5)->text().replace("%", "").trimmed();
+        bool ok = false;
+        double enteredPct = text.toDouble(&ok);
+        if (!ok || enteredPct < 0.0) {
+            updateTableRow(row);
+            return;
+        }
+
+        auto& dbMgr = database::DatabaseManager::instance();
+        QSqlDatabase db = dbMgr.connection();
+        QSqlQuery q(db);
+        q.prepare(R"(
+            SELECT i.*, COALESCE(c.is_discountable, 1) as cat_is_discountable,
+                   COALESCE(c.default_disc_pct, 0.0) as cat_default_disc_pct,
+                   COALESCE(c.max_discount_pct, 15.0) as cat_max_disc_pct
+            FROM items i
+            LEFT JOIN categories c ON i.category_id = c.id
+            WHERE i.id = ?
+        )");
+        q.addBindValue(m_cart[row].itemId);
+
+        domain::Item item;
+        if (q.exec() && q.next()) {
+            item.id = q.value("id").toInt();
+            item.name = q.value("name").toString();
+            item.salePrice = core::Money::fromPaisa(q.value("sale_price_paisa").toLongLong());
+            item.purchaseCost = core::Money::fromPaisa(q.value("purchase_cost_paisa").toLongLong());
+            int64_t tpVal = q.value("tp_paisa").toLongLong();
+            item.tp = (tpVal > 0) ? core::Money::fromPaisa(tpVal) : item.purchaseCost;
+            item.categoryDiscountable = (q.value("cat_is_discountable").toInt() == 1);
+            item.categoryDefaultDiscountPct = q.value("cat_default_disc_pct").toDouble();
+            item.categoryMaxDiscountPct = q.value("cat_max_disc_pct").toDouble();
+            if (item.categoryMaxDiscountPct <= 0.0 && item.categoryDiscountable) {
+                item.categoryMaxDiscountPct = 15.0;
+            }
+            if (!q.value("item_is_discountable").isNull()) {
+                item.isDiscountableOverride = (q.value("item_is_discountable").toInt() == 1);
+            }
+            if (!q.value("override_disc_pct").isNull()) {
+                item.discountPctOverride = q.value("override_disc_pct").toDouble();
+            }
+            item.minMarginPct = q.value("min_margin_pct").toDouble();
+        }
+
+        auto comp = services::PriceCalculator::calculateRowTotals(
+            item,
+            item.categoryDiscountable,
+            item.categoryDefaultDiscountPct,
+            item.categoryMaxDiscountPct,
+            m_cart[row].displayQty,
+            enteredPct,
+            m_cart[row].unitMrp,
+            m_cart[row].unitTp
+        );
+
+        m_cart[row].discountPct = comp.discountPct;
+        m_cart[row].unitDiscount = comp.unitDiscount;
+        m_cart[row].unitSalePrice = comp.unitSalePrice;
+        m_cart[row].unitPrice = comp.unitSalePrice;
+        m_cart[row].totalGross = comp.totalGross;
+        m_cart[row].totalDiscount = comp.totalDiscount;
+        m_cart[row].totalAmount = comp.totalAmount;
+
+        if (comp.wasClampedDueToLoss) {
+            AppToast::showWarning(this, QString("⚠ Margin Protection: Clamped to %1% (Trade Price floor %2).")
+                .arg(QString::number(comp.discountPct, 'f', 1), comp.unitTp.formatted()));
+        }
+
+        updateTableRow(row);
+        updateTotals();
+        m_searchBox->setFocus();
+    } else if (col == 6) {
+        // NET PRICE changed (Reverse calculation)
+        if (!m_cart[row].isDiscountable) {
+            updateTableRow(row);
+            AppToast::showWarning(this, QString("🔒 '%1' is Non-Discountable (FMCG / MRP Locked).").arg(m_cart[row].itemName));
+            return;
+        }
+
+        QString text = m_cartTable->item(row, 6)->text().trimmed();
+        bool ok = false;
+        double enteredPriceRupees = text.toDouble(&ok);
+        if (!ok || enteredPriceRupees <= 0.0) {
+            updateTableRow(row);
+            return;
+        }
+
+        auto& dbMgr = database::DatabaseManager::instance();
+        QSqlDatabase db = dbMgr.connection();
+        QSqlQuery q(db);
+        q.prepare(R"(
+            SELECT i.*, COALESCE(c.is_discountable, 1) as cat_is_discountable,
+                   COALESCE(c.default_disc_pct, 0.0) as cat_default_disc_pct,
+                   COALESCE(c.max_discount_pct, 15.0) as cat_max_disc_pct
+            FROM items i
+            LEFT JOIN categories c ON i.category_id = c.id
+            WHERE i.id = ?
+        )");
+        q.addBindValue(m_cart[row].itemId);
+
+        domain::Item item;
+        if (q.exec() && q.next()) {
+            item.id = q.value("id").toInt();
+            item.name = q.value("name").toString();
+            item.salePrice = core::Money::fromPaisa(q.value("sale_price_paisa").toLongLong());
+            item.purchaseCost = core::Money::fromPaisa(q.value("purchase_cost_paisa").toLongLong());
+            int64_t tpVal = q.value("tp_paisa").toLongLong();
+            item.tp = (tpVal > 0) ? core::Money::fromPaisa(tpVal) : item.purchaseCost;
+            item.categoryDiscountable = (q.value("cat_is_discountable").toInt() == 1);
+            item.categoryDefaultDiscountPct = q.value("cat_default_disc_pct").toDouble();
+            item.categoryMaxDiscountPct = q.value("cat_max_disc_pct").toDouble();
+            if (item.categoryMaxDiscountPct <= 0.0 && item.categoryDiscountable) {
+                item.categoryMaxDiscountPct = 15.0;
+            }
+            if (!q.value("item_is_discountable").isNull()) {
+                item.isDiscountableOverride = (q.value("item_is_discountable").toInt() == 1);
+            }
+            if (!q.value("override_disc_pct").isNull()) {
+                item.discountPctOverride = q.value("override_disc_pct").toDouble();
+            }
+            item.minMarginPct = q.value("min_margin_pct").toDouble();
+        }
+
+        core::Money enteredPrice = core::Money::fromRupees(enteredPriceRupees);
+        auto comp = services::PriceCalculator::calculateReverseFromNetPrice(
+            item,
+            item.categoryDiscountable,
+            item.categoryMaxDiscountPct,
+            m_cart[row].displayQty,
+            enteredPrice,
+            m_cart[row].unitMrp,
+            m_cart[row].unitTp
+        );
+
+        m_cart[row].discountPct = comp.discountPct;
+        m_cart[row].unitDiscount = comp.unitDiscount;
+        m_cart[row].unitSalePrice = comp.unitSalePrice;
+        m_cart[row].unitPrice = comp.unitSalePrice;
+        m_cart[row].totalGross = comp.totalGross;
+        m_cart[row].totalDiscount = comp.totalDiscount;
+        m_cart[row].totalAmount = comp.totalAmount;
+
+        if (comp.wasClampedDueToLoss) {
+            AppToast::showWarning(this, QString("⚠ Margin Protection: Entered price Rs. %1 is below Trade Price (%2)! Clamped to cost floor.")
+                .arg(QString::number(enteredPriceRupees, 'f', 2), comp.unitTp.formatted()));
+        }
+
+        updateTableRow(row);
         updateTotals();
         m_searchBox->setFocus();
     }
@@ -663,14 +1015,37 @@ void SaleWindow::handleQuantityShortcut()
 
 void SaleWindow::handleDiscountShortcut()
 {
+    if (m_cart.empty()) {
+        AppToast::showWarning(this, "Cart is empty.");
+        m_searchBox->setFocus();
+        return;
+    }
+
     bool ok = false;
-    double discRupees = QInputDialog::getDouble(this, "Apply Bill Discount (F4)",
-                                                "Discount Amount (Rs.):",
-                                                m_discount.toRupees(), 0.0, 999999.0, 2, &ok);
+    double discPct = QInputDialog::getDouble(
+        this,
+        "Apply Global Bill Discount (F4)",
+        "Enter Discount % across eligible pharma items:\n(FMCG & Baby Milk will remain locked at 0%)",
+        10.0, 0.0, 100.0, 2, &ok
+    );
     if (ok) {
-        m_discount = core::Money::fromRupees(discRupees);
+        bool anyFmcgSkipped = false;
+        bool anyClampedDueToLoss = false;
+        services::PriceCalculator::applyGlobalBillDiscount(m_cart, discPct, anyFmcgSkipped, anyClampedDueToLoss);
+
+        for (int r = 0; r < static_cast<int>(m_cart.size()); ++r) {
+            updateTableRow(r);
+        }
         updateTotals();
-        AppToast::showInfo(this, QString("Bill discount applied: %1").arg(m_discount.formatted()));
+
+        QString msg = QString("Applied %1% discount to eligible lines.").arg(QString::number(discPct, 'f', 1));
+        if (anyFmcgSkipped) {
+            msg += " FMCG / Baby Milk locked at 0%.";
+        }
+        if (anyClampedDueToLoss) {
+            msg += " Clamped items where discount breached Trade Price.";
+        }
+        AppToast::showInfo(this, msg);
     }
     m_searchBox->setFocus();
 }
@@ -721,11 +1096,59 @@ void SaleWindow::handleHeldBillsShortcut()
             updateCustomerDisplay();
 
             for (const auto& it : restored->items) {
-                domain::Item dummyItem;
-                dummyItem.id = it.itemId;
-                dummyItem.name = it.itemName;
-                dummyItem.salePrice = it.unitPrice;
-                addItemToCart(dummyItem, it.displayQty, it.unitSelection);
+                auto& dbMgr = database::DatabaseManager::instance();
+                QSqlDatabase db = dbMgr.connection();
+                QSqlQuery q(db);
+                q.prepare(R"(
+                    SELECT i.*, c.name as category_name,
+                           COALESCE(c.is_discountable, 1) as cat_is_discountable,
+                           COALESCE(c.default_disc_pct, 0.0) as cat_default_disc_pct,
+                           COALESCE(c.max_discount_pct, 15.0) as cat_max_disc_pct
+                    FROM items i
+                    LEFT JOIN categories c ON i.category_id = c.id
+                    WHERE i.id = ?
+                )");
+                q.addBindValue(it.itemId);
+                if (q.exec() && q.next()) {
+                    domain::Item dbItem;
+                    dbItem.id = q.value("id").toInt();
+                    dbItem.code = q.value("code").toString();
+                    dbItem.name = q.value("name").toString();
+                    dbItem.categoryId = q.value("category_id").toInt();
+                    dbItem.categoryName = q.value("category_name").toString();
+                    dbItem.brand = q.value("brand").toString();
+                    dbItem.barcode = q.value("barcode").toString();
+                    dbItem.salePrice = core::Money::fromPaisa(q.value("sale_price_paisa").toLongLong());
+                    dbItem.purchaseCost = core::Money::fromPaisa(q.value("purchase_cost_paisa").toLongLong());
+                    int64_t tpVal = q.value("tp_paisa").toLongLong();
+                    dbItem.tp = (tpVal > 0) ? core::Money::fromPaisa(tpVal) : dbItem.purchaseCost;
+                    dbItem.isMedicine = (q.value("is_medicine").toInt() == 1);
+                    dbItem.piecesPerStrip = q.value("pieces_per_strip").toInt();
+                    dbItem.stripsPerBox = q.value("strips_per_box").toInt();
+                    dbItem.stripSalePrice = core::Money::fromPaisa(q.value("strip_sale_price_paisa").toLongLong());
+                    dbItem.boxSalePrice = core::Money::fromPaisa(q.value("box_sale_price_paisa").toLongLong());
+                    dbItem.categoryDiscountable = (q.value("cat_is_discountable").toInt() == 1);
+                    dbItem.categoryDefaultDiscountPct = q.value("cat_default_disc_pct").toDouble();
+                    dbItem.categoryMaxDiscountPct = q.value("cat_max_disc_pct").toDouble();
+                    if (dbItem.categoryMaxDiscountPct <= 0.0 && dbItem.categoryDiscountable) {
+                        dbItem.categoryMaxDiscountPct = 15.0;
+                    }
+                    if (!q.value("item_is_discountable").isNull()) {
+                        dbItem.isDiscountableOverride = (q.value("item_is_discountable").toInt() == 1);
+                    }
+                    if (!q.value("override_disc_pct").isNull()) {
+                        dbItem.discountPctOverride = q.value("override_disc_pct").toDouble();
+                    }
+                    dbItem.minMarginPct = q.value("min_margin_pct").toDouble();
+                    addItemToCart(dbItem, it.displayQty, it.unitSelection);
+                } else {
+                    domain::Item dummyItem;
+                    dummyItem.id = it.itemId;
+                    dummyItem.name = it.itemName;
+                    dummyItem.salePrice = it.unitMrp.isPositive() ? it.unitMrp : it.unitPrice;
+                    dummyItem.tp = it.unitTp;
+                    addItemToCart(dummyItem, it.displayQty, it.unitSelection);
+                }
             }
             AppToast::showSuccess(this, "Held bill restored to cart.");
         }
@@ -772,13 +1195,24 @@ void SaleWindow::handleUnitToggleShortcut()
     if (!db.isOpen()) return;
 
     QSqlQuery q(db);
-    q.prepare("SELECT sale_price_paisa, strip_sale_price_paisa, box_sale_price_paisa, pieces_per_strip, strips_per_box, is_medicine FROM items WHERE id = ?");
+    q.prepare(R"(
+        SELECT i.*, COALESCE(c.is_discountable, 1) as cat_is_discountable,
+               COALESCE(c.default_disc_pct, 0.0) as cat_default_disc_pct,
+               COALESCE(c.max_discount_pct, 15.0) as cat_max_disc_pct
+        FROM items i
+        LEFT JOIN categories c ON i.category_id = c.id
+        WHERE i.id = ?
+    )");
     q.addBindValue(cartItem.itemId);
     if (!q.exec() || !q.next()) return;
 
     core::Money piecePrice = core::Money::fromPaisa(q.value("sale_price_paisa").toLongLong());
     core::Money stripPrice = core::Money::fromPaisa(q.value("strip_sale_price_paisa").toLongLong());
     core::Money boxPrice = core::Money::fromPaisa(q.value("box_sale_price_paisa").toLongLong());
+    core::Money purchaseCost = core::Money::fromPaisa(q.value("purchase_cost_paisa").toLongLong());
+    int64_t tpVal = q.value("tp_paisa").toLongLong();
+    core::Money baseTp = (tpVal > 0) ? core::Money::fromPaisa(tpVal) : purchaseCost;
+
     int piecesPerStrip = q.value("pieces_per_strip").toInt();
     int stripsPerBox = q.value("strips_per_box").toInt();
     bool isMedicine = (q.value("is_medicine").toInt() == 1);
@@ -791,53 +1225,90 @@ void SaleWindow::handleUnitToggleShortcut()
     domain::SaleUnitSelection nextUnit = domain::SaleUnitSelection::PieceOrTablet;
     QString unitStr = isMedicine ? "Tablet" : "Piece";
     int atomicPerUnit = 1;
-    core::Money newUnitPrice = piecePrice;
+    core::Money newUnitMrp = piecePrice;
+    core::Money newUnitTp = baseTp;
 
     if (cartItem.unitSelection == domain::SaleUnitSelection::PieceOrTablet) {
         if (piecesPerStrip > 1) {
             nextUnit = domain::SaleUnitSelection::Strip;
             unitStr = "Strip";
             atomicPerUnit = piecesPerStrip;
-            newUnitPrice = stripPrice.isPositive() ? stripPrice : (piecePrice * piecesPerStrip);
+            newUnitMrp = stripPrice.isPositive() ? stripPrice : (piecePrice * piecesPerStrip);
+            newUnitTp = baseTp * piecesPerStrip;
         } else if (stripsPerBox > 1) {
             nextUnit = domain::SaleUnitSelection::Box;
             unitStr = "Box";
             atomicPerUnit = stripsPerBox;
-            newUnitPrice = boxPrice.isPositive() ? boxPrice : (piecePrice * stripsPerBox);
+            newUnitMrp = boxPrice.isPositive() ? boxPrice : (piecePrice * stripsPerBox);
+            newUnitTp = baseTp * stripsPerBox;
         }
     } else if (cartItem.unitSelection == domain::SaleUnitSelection::Strip) {
         if (stripsPerBox > 1) {
             nextUnit = domain::SaleUnitSelection::Box;
             unitStr = "Box";
             atomicPerUnit = stripsPerBox * piecesPerStrip;
-            newUnitPrice = boxPrice.isPositive() ? boxPrice : (piecePrice * atomicPerUnit);
+            newUnitMrp = boxPrice.isPositive() ? boxPrice : (piecePrice * atomicPerUnit);
+            newUnitTp = baseTp * atomicPerUnit;
         } else {
             nextUnit = domain::SaleUnitSelection::PieceOrTablet;
             unitStr = isMedicine ? "Tablet" : "Piece";
             atomicPerUnit = 1;
-            newUnitPrice = piecePrice;
+            newUnitMrp = piecePrice;
+            newUnitTp = baseTp;
         }
     } else { // Currently Box
         nextUnit = domain::SaleUnitSelection::PieceOrTablet;
         unitStr = isMedicine ? "Tablet" : "Piece";
         atomicPerUnit = 1;
-        newUnitPrice = piecePrice;
+        newUnitMrp = piecePrice;
+        newUnitTp = baseTp;
     }
+
+    domain::Item item;
+    item.id = cartItem.itemId;
+    item.name = cartItem.itemName;
+    item.categoryDiscountable = (q.value("cat_is_discountable").toInt() == 1);
+    item.categoryDefaultDiscountPct = q.value("cat_default_disc_pct").toDouble();
+    item.categoryMaxDiscountPct = q.value("cat_max_disc_pct").toDouble();
+    if (item.categoryMaxDiscountPct <= 0.0 && item.categoryDiscountable) {
+        item.categoryMaxDiscountPct = 15.0;
+    }
+    if (!q.value("item_is_discountable").isNull()) {
+        item.isDiscountableOverride = (q.value("item_is_discountable").toInt() == 1);
+    }
+    if (!q.value("override_disc_pct").isNull()) {
+        item.discountPctOverride = q.value("override_disc_pct").toDouble();
+    }
+    item.minMarginPct = q.value("min_margin_pct").toDouble();
+
+    auto comp = services::PriceCalculator::calculateRowTotals(
+        item,
+        item.categoryDiscountable,
+        item.categoryDefaultDiscountPct,
+        item.categoryMaxDiscountPct,
+        cartItem.displayQty,
+        cartItem.discountPct,
+        newUnitMrp,
+        newUnitTp
+    );
 
     cartItem.unitSelection = nextUnit;
     cartItem.atomicUnitsPerQty = atomicPerUnit;
     cartItem.totalAtomicQty = cartItem.displayQty * atomicPerUnit;
-    cartItem.unitPrice = newUnitPrice;
-    cartItem.totalAmount = newUnitPrice * cartItem.displayQty;
+    cartItem.unitMrp = comp.unitMrp;
+    cartItem.unitTp = comp.unitTp;
+    cartItem.isDiscountable = comp.isDiscountable;
+    cartItem.discountPct = comp.discountPct;
+    cartItem.unitDiscount = comp.unitDiscount;
+    cartItem.unitSalePrice = comp.unitSalePrice;
+    cartItem.unitPrice = comp.unitSalePrice;
+    cartItem.totalGross = comp.totalGross;
+    cartItem.totalDiscount = comp.totalDiscount;
+    cartItem.totalAmount = comp.totalAmount;
 
-    m_cartTable->blockSignals(true);
-    m_cartTable->item(row, 2)->setText(unitStr);
-    m_cartTable->item(row, 4)->setText(newUnitPrice.formatted(false));
-    m_cartTable->item(row, 5)->setText(cartItem.totalAmount.formatted());
-    m_cartTable->blockSignals(false);
-
+    updateTableRow(row);
     updateTotals();
-    AppToast::showInfo(this, QString("Switched to %1 (%2)").arg(unitStr, newUnitPrice.formatted()));
+    AppToast::showInfo(this, QString("Switched to %1 (%2)").arg(unitStr, comp.unitSalePrice.formatted()));
 }
 
 void SaleWindow::handleIncrementQty()
@@ -854,12 +1325,11 @@ void SaleWindow::handleIncrementQty()
 
     m_cart[row].displayQty += 1;
     m_cart[row].totalAtomicQty = m_cart[row].displayQty * m_cart[row].atomicUnitsPerQty;
-    m_cart[row].totalAmount = m_cart[row].unitPrice * m_cart[row].displayQty;
+    m_cart[row].totalGross = m_cart[row].unitMrp * m_cart[row].displayQty;
+    m_cart[row].totalDiscount = m_cart[row].unitDiscount * m_cart[row].displayQty;
+    m_cart[row].totalAmount = m_cart[row].unitSalePrice * m_cart[row].displayQty;
 
-    m_cartTable->blockSignals(true);
-    m_cartTable->item(row, 3)->setText(QString::number(m_cart[row].displayQty));
-    m_cartTable->item(row, 5)->setText(m_cart[row].totalAmount.formatted());
-    m_cartTable->blockSignals(false);
+    updateTableRow(row);
     updateTotals();
 }
 
@@ -878,12 +1348,11 @@ void SaleWindow::handleDecrementQty()
     if (m_cart[row].displayQty > 1 || m_cart[row].displayQty < -1) {
         m_cart[row].displayQty -= (m_cart[row].displayQty > 0 ? 1 : -1);
         m_cart[row].totalAtomicQty = m_cart[row].displayQty * m_cart[row].atomicUnitsPerQty;
-        m_cart[row].totalAmount = m_cart[row].unitPrice * m_cart[row].displayQty;
+        m_cart[row].totalGross = m_cart[row].unitMrp * m_cart[row].displayQty;
+        m_cart[row].totalDiscount = m_cart[row].unitDiscount * m_cart[row].displayQty;
+        m_cart[row].totalAmount = m_cart[row].unitSalePrice * m_cart[row].displayQty;
 
-        m_cartTable->blockSignals(true);
-        m_cartTable->item(row, 3)->setText(QString::number(m_cart[row].displayQty));
-        m_cartTable->item(row, 5)->setText(m_cart[row].totalAmount.formatted());
-        m_cartTable->blockSignals(false);
+        updateTableRow(row);
         updateTotals();
     } else {
         handleRemoveSelectedItem();
@@ -892,9 +1361,9 @@ void SaleWindow::handleDecrementQty()
 
 void SaleWindow::handleChillarRoundShortcut()
 {
-    core::Money subtotal;
-    for (const auto& it : m_cart) subtotal += it.totalAmount;
-    core::Money currentNet = subtotal - m_discount;
+    core::Money netTotal;
+    for (const auto& it : m_cart) netTotal += it.totalAmount;
+    core::Money currentNet = netTotal - m_discount;
     if (currentNet.isNegative() || currentNet.paisa() == 0) {
         AppToast::showWarning(this, "No payable amount to round.");
         return;
@@ -977,7 +1446,7 @@ void SaleWindow::loadMutabadilForGeneric(const QString& genericName, int exclude
     if (excludeItemId > 0) {
         for (const auto& it : m_cart) {
             if (it.itemId == excludeItemId) {
-                referencePrice = it.unitPrice;
+                referencePrice = it.unitSalePrice;
                 break;
             }
         }
@@ -992,7 +1461,7 @@ void SaleWindow::loadMutabadilForGeneric(const QString& genericName, int exclude
         int stock = q.value("total_stock").toInt();
 
         m_mutabadilTable->insertRow(row);
-        
+
         auto* nameItem = new QTableWidgetItem(name);
         nameItem->setData(Qt::UserRole, id);
         if (id == excludeItemId) {
@@ -1064,10 +1533,18 @@ void SaleWindow::handleCheckoutShortcut()
         }
     }
 
-    core::Money subtotal;
-    for (const auto& it : m_cart) subtotal += it.totalAmount;
-    core::Money grandTotal = subtotal - m_discount;
+    core::Money grossTotal;
+    core::Money totalLineDiscount;
+    core::Money netTotal;
+    for (const auto& it : m_cart) {
+        grossTotal += it.totalGross;
+        totalLineDiscount += it.totalDiscount;
+        netTotal += it.totalAmount;
+    }
+
+    core::Money grandTotal = netTotal - m_discount;
     if (grandTotal.isNegative()) grandTotal = core::Money(0);
+    core::Money totalAllDiscount = totalLineDiscount + m_discount;
 
     PaymentDialog dlg(grandTotal, m_currentCustomer, this);
     if (dlg.exec() == QDialog::Accepted) {
@@ -1076,8 +1553,8 @@ void SaleWindow::handleCheckoutShortcut()
         sale.customerName = m_currentCustomer.name;
         sale.paymentType = dlg.selectedPaymentType();
         sale.payments = dlg.paymentAllocations();
-        sale.subtotal = subtotal;
-        sale.discount = m_discount;
+        sale.subtotal = grossTotal;
+        sale.discount = totalAllDiscount;
         sale.netTotal = grandTotal;
         sale.cashReceived = dlg.cashReceived();
         sale.changeGiven = dlg.changeGiven();

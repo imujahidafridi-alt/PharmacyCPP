@@ -26,6 +26,11 @@ struct Category {
     int id{0};
     QString name;
     QString description;
+    
+    // Departmental Discount Defaults
+    bool isDiscountable{true};
+    double defaultDiscountPct{0.0};
+    double maxDiscountPct{15.0};
 };
 
 enum class StockUnitType {
@@ -44,9 +49,10 @@ struct Item {
     QString brand;
     QString barcode;
     
-    // Pricing
-    core::Money salePrice;
-    core::Money purchaseCost;
+    // Pricing: MRP (Printed Retail Price) & TP (Trade Price / Wholesale Cost)
+    core::Money salePrice;          // MRP
+    core::Money purchaseCost;       // TP
+    core::Money tp;                 // Trade price floor (synced with purchaseCost)
     
     // Inventory settings
     int minStockAlert{10};
@@ -65,6 +71,32 @@ struct Item {
     int stripsPerBox{1};
     core::Money stripSalePrice;
     core::Money boxSalePrice;
+
+    // Pricing & Margin Protection overrides (std::nullopt means inherit from Category)
+    std::optional<bool> isDiscountableOverride{std::nullopt};
+    std::optional<double> discountPctOverride{std::nullopt};
+    double minMarginPct{0.0}; // Safety buffer above TP (Loss-prevention)
+
+    // Resolved category defaults
+    bool categoryDiscountable{true};
+    double categoryDefaultDiscountPct{0.0};
+    double categoryMaxDiscountPct{15.0};
+
+    bool isDiscountable() const {
+        return isDiscountableOverride.value_or(categoryDiscountable);
+    }
+    bool isDiscountable(bool fallbackCatDiscountable) const {
+        return isDiscountableOverride.value_or(fallbackCatDiscountable);
+    }
+
+    double defaultDiscountPercent() const {
+        if (!isDiscountable()) return 0.0;
+        return discountPctOverride.value_or(categoryDefaultDiscountPct);
+    }
+    double defaultDiscountPercent(bool fallbackCatDiscountable, double fallbackCatDefaultPct) const {
+        if (!isDiscountable(fallbackCatDiscountable)) return 0.0;
+        return discountPctOverride.value_or(fallbackCatDefaultPct);
+    }
 };
 
 struct Batch {
@@ -145,8 +177,19 @@ struct CartItem {
     int displayQty{1};        // User entered quantity (e.g. 2 strips)
     int atomicUnitsPerQty{1}; // e.g. 10 tablets per strip
     int totalAtomicQty{1};    // displayQty * atomicUnitsPerQty
-    core::Money unitPrice;    // Price for selected unit
-    core::Money totalAmount;
+    
+    // Complete Pricing Architecture
+    core::Money unitMrp;          // Base MRP for selected unit
+    core::Money unitTp;           // Trade Price (Cost floor)
+    bool isDiscountable{true};    // Strict lock (FMCG = false)
+    double discountPct{0.0};      // Active row discount % (e.g. 10.0)
+    core::Money unitDiscount;     // unitMrp * (discountPct / 100)
+    core::Money unitSalePrice;    // unitMrp - unitDiscount (Net per unit)
+    core::Money unitPrice;        // Alias for compatibility (= unitSalePrice)
+    
+    core::Money totalGross;       // unitMrp * displayQty
+    core::Money totalDiscount;    // unitDiscount * displayQty
+    core::Money totalAmount;      // unitSalePrice * displayQty (Net Line Total)
     
     // FEFO Batch Allocation details
     int batchId{0};

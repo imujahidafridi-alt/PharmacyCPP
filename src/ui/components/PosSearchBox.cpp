@@ -343,9 +343,13 @@ void PosSearchBox::handleTextEdited(const QString& text)
     QSqlQuery q(db);
     q.prepare(R"(
         SELECT i.id, i.code, i.name, i.category_id, c.name as category_name, i.brand, i.barcode,
-               i.sale_price_paisa, i.purchase_cost_paisa, i.min_stock_alert, i.is_active,
+               i.sale_price_paisa, i.purchase_cost_paisa, i.tp_paisa, i.min_stock_alert, i.is_active,
                i.is_medicine, i.generic_name, i.strength, i.dosage_form,
                i.pieces_per_strip, i.strips_per_box, i.strip_sale_price_paisa, i.box_sale_price_paisa,
+               i.is_discountable as item_is_discountable, i.override_disc_pct, i.min_margin_pct,
+               COALESCE(c.is_discountable, 1) as cat_is_discountable,
+               COALESCE(c.default_disc_pct, 0.0) as cat_default_disc_pct,
+               COALESCE(c.max_discount_pct, 15.0) as cat_max_disc_pct,
                COALESCE((SELECT SUM(sb.quantity) FROM stock_balances sb WHERE sb.item_id = i.id), 0) as total_stock
         FROM items i
         LEFT JOIN categories c ON i.category_id = c.id
@@ -371,10 +375,16 @@ void PosSearchBox::handleTextEdited(const QString& text)
             res.item.id = q.value("id").toInt();
             res.item.code = q.value("code").toString();
             res.item.name = q.value("name").toString();
+            res.item.categoryId = q.value("category_id").toInt();
             res.item.categoryName = q.value("category_name").toString();
             res.item.brand = q.value("brand").toString();
             res.item.barcode = q.value("barcode").toString();
             res.item.salePrice = core::Money::fromPaisa(q.value("sale_price_paisa").toLongLong());
+            res.item.purchaseCost = core::Money::fromPaisa(q.value("purchase_cost_paisa").toLongLong());
+            
+            int64_t tpVal = q.value("tp_paisa").toLongLong();
+            res.item.tp = (tpVal > 0) ? core::Money::fromPaisa(tpVal) : res.item.purchaseCost;
+
             res.item.isMedicine = (q.value("is_medicine").toInt() == 1);
             res.item.genericName = q.value("generic_name").toString();
             res.item.strength = q.value("strength").toString();
@@ -383,6 +393,23 @@ void PosSearchBox::handleTextEdited(const QString& text)
             res.item.stripsPerBox = q.value("strips_per_box").toInt();
             res.item.stripSalePrice = core::Money::fromPaisa(q.value("strip_sale_price_paisa").toLongLong());
             res.item.boxSalePrice = core::Money::fromPaisa(q.value("box_sale_price_paisa").toLongLong());
+
+            // Category & Item Discount Policies
+            res.item.categoryDiscountable = (q.value("cat_is_discountable").toInt() == 1);
+            res.item.categoryDefaultDiscountPct = q.value("cat_default_disc_pct").toDouble();
+            res.item.categoryMaxDiscountPct = q.value("cat_max_disc_pct").toDouble();
+            if (res.item.categoryMaxDiscountPct <= 0.0 && res.item.categoryDiscountable) {
+                res.item.categoryMaxDiscountPct = 15.0;
+            }
+
+            if (!q.value("item_is_discountable").isNull()) {
+                res.item.isDiscountableOverride = (q.value("item_is_discountable").toInt() == 1);
+            }
+            if (!q.value("override_disc_pct").isNull()) {
+                res.item.discountPctOverride = q.value("override_disc_pct").toDouble();
+            }
+            res.item.minMarginPct = q.value("min_margin_pct").toDouble();
+
             res.totalStock = q.value("total_stock").toInt();
             results.push_back(res);
         }

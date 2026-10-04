@@ -11,6 +11,7 @@
 #include "services/PurchaseService.h"
 #include "services/LedgerService.h"
 #include "services/ReturnService.h"
+#include "services/PriceCalculator.h"
 #include "printing/ReceiptRenderer.h"
 
 #define TEST_ASSERT(cond, msg) \
@@ -211,6 +212,113 @@ bool runAllScenarioTests() {
 
     QByteArray escposData = printing::ReceiptRenderer::renderEscPos(saleRes.value());
     TEST_ASSERT(!escposData.isEmpty(), "Binary ESC/POS thermal command stream generated");
+
+    // SCENARIO 36: Pakistani Retail Pricing Architecture & Edge Cases
+    std::cout << "\n[Test 10] Pakistani Retail Pricing Engine & Loss Prevention" << std::endl;
+
+    // 10.1 FMCG Non-Discountable Lock (Baby Milk / Pampers / Face Wash)
+    domain::Item fmcgItem;
+    fmcgItem.id = 101;
+    fmcgItem.name = "Pampers Baby Dry Diapers";
+    fmcgItem.salePrice = core::Money::fromRupees(2500.0);
+    fmcgItem.purchaseCost = core::Money::fromRupees(2300.0);
+    fmcgItem.tp = fmcgItem.purchaseCost;
+    fmcgItem.categoryDiscountable = false; // Inherited from Baby Care category
+    fmcgItem.categoryDefaultDiscountPct = 0.0;
+    fmcgItem.categoryMaxDiscountPct = 0.0;
+
+    auto fmcgComp = services::PriceCalculator::calculateRowTotals(fmcgItem, 1, 15.0);
+    TEST_ASSERT(!fmcgComp.isDiscountable, "FMCG item is flagged non-discountable");
+    TEST_ASSERT(fmcgComp.discountPct == 0.0, "FMCG discount % rigidly locked at 0% despite 15% request");
+    TEST_ASSERT(fmcgComp.unitDiscount.paisa() == 0, "FMCG discount amount is 0 paisa");
+    TEST_ASSERT(fmcgComp.unitSalePrice == core::Money::fromRupees(2500.0), "FMCG net price is printed MRP (Rs. 2,500)");
+    TEST_ASSERT(fmcgComp.totalAmount == core::Money::fromRupees(2500.0), "FMCG line total equals gross MRP");
+
+    // 10.2 Category-Level vs Item-Level Defaults
+    domain::Item pharmaItem;
+    pharmaItem.id = 102;
+    pharmaItem.name = "Panadol 500mg Tablets";
+    pharmaItem.salePrice = core::Money::fromRupees(500.0);
+    pharmaItem.purchaseCost = core::Money::fromRupees(400.0);
+    pharmaItem.tp = pharmaItem.purchaseCost;
+    pharmaItem.categoryDiscountable = true;
+    pharmaItem.categoryDefaultDiscountPct = 10.0;
+    pharmaItem.categoryMaxDiscountPct = 15.0;
+
+    // Auto inherit category default (10%)
+    auto pharmaComp = services::PriceCalculator::calculateRowTotals(pharmaItem, 1, -1.0);
+    TEST_ASSERT(pharmaComp.isDiscountable, "Pharma medicine is discountable");
+    TEST_ASSERT(pharmaComp.discountPct == 10.0, "Pharma correctly inherits category default 10% discount");
+    TEST_ASSERT(pharmaComp.unitDiscount == core::Money::fromRupees(50.0), "10% discount on Rs. 500 is exact Rs. 50");
+    TEST_ASSERT(pharmaComp.unitSalePrice == core::Money::fromRupees(450.0), "Net price after 10% discount is Rs. 450");
+
+    // Item-level override takes precedence over category
+    pharmaItem.discountPctOverride = 7.0;
+    auto overrideComp = services::PriceCalculator::calculateRowTotals(pharmaItem, 1, -1.0);
+    TEST_ASSERT(overrideComp.discountPct == 7.0, "Item-level discount override (7%) overrides category default (10%)");
+
+    // 10.3 Margin Protection (Loss Prevention against Trade Price / Cost Floor)
+    domain::Item tightMarginItem;
+    tightMarginItem.id = 103;
+    tightMarginItem.name = "Expensive Antibiotic";
+    tightMarginItem.salePrice = core::Money::fromRupees(1000.0);
+    tightMarginItem.purchaseCost = core::Money::fromRupees(920.0);
+    tightMarginItem.tp = tightMarginItem.purchaseCost;
+    tightMarginItem.categoryDiscountable = true;
+    tightMarginItem.categoryDefaultDiscountPct = 10.0;
+    tightMarginItem.categoryMaxDiscountPct = 15.0;
+
+    // Cashier attempts 15% discount (which would result in Rs. 850, below TP Rs. 920!)
+    auto marginComp = services::PriceCalculator::calculateRowTotals(tightMarginItem, 1, 15.0);
+    TEST_ASSERT(marginComp.wasClampedDueToLoss, "Loss prevention triggered when requested price drops below TP");
+    TEST_ASSERT(marginComp.unitSalePrice == core::Money::fromRupees(920.0), "Sale price clamped strictly to TP floor (Rs. 920)");
+    TEST_ASSERT(marginComp.unitDiscount == core::Money::fromRupees(80.0), "Discount clamped to maximum allowable margin (Rs. 80 / 8%)");
+
+    // 10.4 Reverse Calculation from Bargained Net Price
+    // Customer bargains to pay Rs. 450 on Rs. 500 item
+    pharmaItem.discountPctOverride = std::nullopt;
+    auto revComp = services::PriceCalculator::calculateReverseFromNetPrice(pharmaItem, 1, core::Money::fromRupees(450.0));
+    TEST_ASSERT(revComp.discountPct == 10.0, "Reverse calculation derived exactly 10% from Rs. 450 net price");
+    TEST_ASSERT(revComp.unitDiscount == core::Money::fromRupees(50.0), "Reverse calculation gave Rs. 50 discount");
+    TEST_ASSERT(revComp.unitSalePrice == core::Money::fromRupees(450.0), "Unit sale price matches entered bargained price");
+
+    // Reverse calculation below TP is clamped
+    auto revLossComp = services::PriceCalculator::calculateReverseFromNetPrice(tightMarginItem, 1, core::Money::fromRupees(800.0));
+    TEST_ASSERT(revLossComp.wasClampedDueToLoss, "Reverse calculation clamped when bargained price is below TP");
+    TEST_ASSERT(revLossComp.unitSalePrice == core::Money::fromRupees(920.0), "Reverse calculation clamped to TP floor (Rs. 920)");
+
+    // 10.5 Global Bill Discount (F4) protecting FMCG lines
+    std::vector<domain::CartItem> testCart;
+    domain::CartItem cPharma;
+    cPharma.itemId = 102;
+    cPharma.itemName = "Panadol 500mg Tablets";
+    cPharma.displayQty = 2;
+    cPharma.unitMrp = core::Money::fromRupees(500.0);
+    cPharma.unitTp = core::Money::fromRupees(400.0);
+    cPharma.isDiscountable = true;
+    cPharma.totalGross = core::Money::fromRupees(1000.0);
+    testCart.push_back(cPharma);
+
+    domain::CartItem cFmcg;
+    cFmcg.itemId = 101;
+    cFmcg.itemName = "Pampers Baby Dry Diapers";
+    cFmcg.displayQty = 1;
+    cFmcg.unitMrp = core::Money::fromRupees(2500.0);
+    cFmcg.unitTp = core::Money::fromRupees(2300.0);
+    cFmcg.isDiscountable = false;
+    cFmcg.totalGross = core::Money::fromRupees(2500.0);
+    testCart.push_back(cFmcg);
+
+    bool anySkipped = false;
+    bool anyClamped = false;
+    services::PriceCalculator::applyGlobalBillDiscount(testCart, 10.0, anySkipped, anyClamped);
+
+    TEST_ASSERT(anySkipped, "Global bill discount reported FMCG line was skipped");
+    TEST_ASSERT(testCart[1].discountPct == 0.0, "FMCG line retained 0% discount under global bill discount");
+    TEST_ASSERT(testCart[1].totalAmount == core::Money::fromRupees(2500.0), "FMCG line total retained full Rs. 2,500");
+    TEST_ASSERT(testCart[0].discountPct == 10.0, "Pharma line received 10% global bill discount");
+    TEST_ASSERT(testCart[0].totalDiscount == core::Money::fromRupees(100.0), "Pharma line total discount is Rs. 100");
+    TEST_ASSERT(testCart[0].totalAmount == core::Money::fromRupees(900.0), "Pharma line net total is Rs. 900");
 
     std::cout << "\n==========================================" << std::endl;
     std::cout << "ALL ACCEPTANCE TESTS PASSED (100% SUCCESS)" << std::endl;

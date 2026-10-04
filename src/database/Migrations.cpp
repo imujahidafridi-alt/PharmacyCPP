@@ -30,7 +30,10 @@ QString Migrations::getInitialSchemaSql(bool isPostgres)
         CREATE TABLE IF NOT EXISTS categories (
             id %1,
             name %2 UNIQUE NOT NULL,
-            description TEXT
+            description TEXT,
+            is_discountable INTEGER NOT NULL DEFAULT 1,
+            default_disc_pct REAL NOT NULL DEFAULT 0.0,
+            max_discount_pct REAL NOT NULL DEFAULT 15.0
         );
 
         CREATE TABLE IF NOT EXISTS items (
@@ -42,6 +45,7 @@ QString Migrations::getInitialSchemaSql(bool isPostgres)
             barcode %2,
             sale_price_paisa BIGINT NOT NULL DEFAULT 0,
             purchase_cost_paisa BIGINT NOT NULL DEFAULT 0,
+            tp_paisa BIGINT NOT NULL DEFAULT 0,
             min_stock_alert INTEGER DEFAULT 10,
             is_active INTEGER DEFAULT 1,
             is_medicine INTEGER DEFAULT 0,
@@ -53,6 +57,9 @@ QString Migrations::getInitialSchemaSql(bool isPostgres)
             strips_per_box INTEGER DEFAULT 1,
             strip_sale_price_paisa BIGINT DEFAULT 0,
             box_sale_price_paisa BIGINT DEFAULT 0,
+            is_discountable INTEGER DEFAULT NULL,
+            override_disc_pct REAL DEFAULT NULL,
+            min_margin_pct REAL DEFAULT 0.0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -244,16 +251,16 @@ QString Migrations::getSeedDataSql(bool /*isPostgres*/)
             (1, 'Cash Purchase / Local Market', '', 'Local Wholesale Market', 0, 'General direct cash wholesale')
         ON CONFLICT DO NOTHING;
 
-        INSERT INTO categories (id, name, description)
+        INSERT INTO categories (id, name, description, is_discountable, default_disc_pct, max_discount_pct)
         VALUES 
-            (1, 'Tablets & Capsules', 'Oral solid pharmaceuticals'),
-            (2, 'Syrups & Suspensions', 'Liquid oral pharmaceuticals'),
-            (3, 'Injections & Infusions', 'Parenteral medications'),
-            (4, 'Creams & Ointments', 'Topical medications'),
-            (5, 'Baby Care', 'Pampers, baby food and accessories'),
-            (6, 'Personal Care', 'Soaps, face wash, shampoos'),
-            (7, 'Beverages & Nutrition', 'Energy drinks, juices, supplements'),
-            (8, 'General Retail / First Aid', 'Bandages, cotton, thermometers, retail')
+            (1, 'Tablets & Capsules', 'Oral solid pharmaceuticals', 1, 10.0, 15.0),
+            (2, 'Syrups & Suspensions', 'Liquid oral pharmaceuticals', 1, 7.0, 12.0),
+            (3, 'Injections & Infusions', 'Parenteral medications', 1, 5.0, 10.0),
+            (4, 'Creams & Ointments', 'Topical medications', 1, 5.0, 10.0),
+            (5, 'Baby Care', 'Pampers, baby food and accessories (FMCG strictly at MRP)', 0, 0.0, 0.0),
+            (6, 'Personal Care', 'Soaps, face wash, shampoos (FMCG strictly at MRP)', 0, 0.0, 0.0),
+            (7, 'Beverages & Nutrition', 'Energy drinks, juices, supplements (FMCG strictly at MRP)', 0, 0.0, 0.0),
+            (8, 'General Retail / First Aid', 'Bandages, cotton, thermometers, retail', 1, 5.0, 10.0)
         ON CONFLICT DO NOTHING;
 
         -- Default initial settings
@@ -287,6 +294,25 @@ core::Result<void, core::AppError> Migrations::runMigrations()
                     core::AppError::fromSqlError(q.lastError().text(), "Schema migration failed on statement.")
                 );
             }
+        }
+
+        // Schema upgrades for existing databases (idempotent / non-destructive)
+        QStringList upgrades = {
+            "ALTER TABLE categories ADD COLUMN is_discountable INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE categories ADD COLUMN default_disc_pct REAL NOT NULL DEFAULT 0.0",
+            "ALTER TABLE categories ADD COLUMN max_discount_pct REAL NOT NULL DEFAULT 15.0",
+            "ALTER TABLE items ADD COLUMN tp_paisa BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE items ADD COLUMN is_discountable INTEGER DEFAULT NULL",
+            "ALTER TABLE items ADD COLUMN override_disc_pct REAL DEFAULT NULL",
+            "ALTER TABLE items ADD COLUMN min_margin_pct REAL DEFAULT 0.0",
+            "UPDATE items SET tp_paisa = purchase_cost_paisa WHERE tp_paisa = 0",
+            "UPDATE categories SET is_discountable = 0, default_disc_pct = 0.0, max_discount_pct = 0.0 WHERE id IN (5, 6, 7)",
+            "UPDATE categories SET is_discountable = 1, default_disc_pct = 10.0, max_discount_pct = 15.0 WHERE id = 1",
+            "UPDATE categories SET is_discountable = 1, default_disc_pct = 7.0, max_discount_pct = 12.0 WHERE id = 2",
+            "UPDATE categories SET is_discountable = 1, default_disc_pct = 5.0, max_discount_pct = 10.0 WHERE id IN (3, 4, 8)"
+        };
+        for (const auto& u : upgrades) {
+            q.exec(u); // silently succeed or ignore if column already exists
         }
 
         // Execute seed data
