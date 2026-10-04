@@ -1,0 +1,47 @@
+# Build artifacts
+build/
+bin/
+dist/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.ninja
+*.ninja_deps
+*.ninja_log
+
+# Compiled binaries and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Qt generated files
+*_autogen/
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# Databases and local runtime data
+*.db
+*.sqlite
+*.sqlite3
+test_pharmacy.db
+
+# IDE & Editor configurations
+.vs/
+.vscode/
+.idea/
+*.user
+*.user.*
+*.suo
+
+# System and logs
+*.log
+Thumbs.db
+.DS_Store
